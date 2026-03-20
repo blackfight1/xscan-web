@@ -63,9 +63,10 @@ type XssResult struct {
 
 // API request/response types
 type CreateTaskRequest struct {
-	Mode       string `json:"mode"`
-	RootDomain string `json:"root_domain"`
-	TargetURL  string `json:"target_url"`
+	Mode       string   `json:"mode"`
+	RootDomain string   `json:"root_domain"`
+	TargetURL  string   `json:"target_url"`
+	Targets    []string `json:"targets"`
 }
 
 type TaskListResponse struct {

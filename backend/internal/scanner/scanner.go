@@ -279,28 +279,54 @@ func (s *Scanner) executeTask(taskID string) {
 	}
 
 	if mode == models.ScanModeURL {
-		targetURL := strings.TrimSpace(task.TargetURL)
-		if targetURL == "" {
-			targetURL = strings.TrimSpace(task.RootDomain)
+		rawTarget := strings.TrimSpace(task.TargetURL)
+		if rawTarget == "" {
+			rawTarget = strings.TrimSpace(task.RootDomain)
 		}
-		if !isValidHTTPURL(targetURL) {
-			s.failTask(taskID, fmt.Sprintf("invalid target_url: %s", targetURL))
+
+		// Split by newlines to support batch URLs
+		var urlList []string
+		for _, line := range strings.Split(rawTarget, "\n") {
+			line = strings.TrimSpace(line)
+			if line != "" && isValidHTTPURL(line) {
+				urlList = append(urlList, line)
+			}
+		}
+		if len(urlList) == 0 {
+			s.failTask(taskID, fmt.Sprintf("no valid URLs found in target: %s", rawTarget))
 			return
 		}
 
-		s.updateTaskStatus(taskID, models.StatusScanning, "running xscan spider -u")
-		database.DB.Exec("INSERT INTO alive_urls (task_id, url) VALUES (?, ?)", taskID, targetURL)
-		s.updateTaskCount(taskID, "alive_count", 1)
+		// Store all URLs as alive_urls
+		for _, u := range urlList {
+			database.DB.Exec("INSERT INTO alive_urls (task_id, url) VALUES (?, ?)", taskID, u)
+		}
+		s.updateTaskCount(taskID, "alive_count", len(urlList))
 
-		xssCount, err := s.runXscanSingleURL(taskID, targetURL, taskDir)
-		if err != nil {
-			s.failTask(taskID, fmt.Sprintf("xscan spider -u failed: %v", err))
-			return
+		var xssCount int
+		var err error
+
+		if len(urlList) == 1 {
+			// Single URL: use xscan spider -u
+			s.updateTaskStatus(taskID, models.StatusScanning, fmt.Sprintf("running xscan spider -u (%s)", urlList[0]))
+			xssCount, err = s.runXscanSingleURL(taskID, urlList[0], taskDir)
+			if err != nil {
+				s.failTask(taskID, fmt.Sprintf("xscan spider -u failed: %v", err))
+				return
+			}
+		} else {
+			// Multiple URLs: use xscan spider -f
+			s.updateTaskStatus(taskID, models.StatusScanning, fmt.Sprintf("running xscan spider -f (%d URLs)", len(urlList)))
+			xssCount, err = s.runXscan(taskID, urlList, taskDir)
+			if err != nil {
+				s.failTask(taskID, fmt.Sprintf("xscan spider -f failed: %v", err))
+				return
+			}
 		}
 
 		s.updateTaskCount(taskID, "xss_count", xssCount)
 		s.completeTask(taskID)
-		log.Printf("[Task %s] Completed URL mode. Found %d XSS vulnerabilities", taskID, xssCount)
+		log.Printf("[Task %s] Completed URL mode (%d URLs). Found %d XSS vulnerabilities", taskID, len(urlList), xssCount)
 		return
 	}
 

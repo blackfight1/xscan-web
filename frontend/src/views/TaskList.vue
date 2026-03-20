@@ -6,31 +6,44 @@
       <div class="create-inner">
         <div class="create-title">
           <h2>New Scan</h2>
-          <p>Enter a target to start XSS vulnerability scanning</p>
+          <p>Enter targets to start XSS vulnerability scanning</p>
         </div>
         <div class="create-form">
           <div class="mode-switch">
             <button :class="['mode-btn', { active: scanMode === 'domain' }]" @click="scanMode = 'domain'">
               <el-icon><Globe /></el-icon>
-              Domain
+              Domain Mode
             </button>
             <button :class="['mode-btn', { active: scanMode === 'url' }]" @click="scanMode = 'url'">
               <el-icon><Link /></el-icon>
-              URL
+              URL Mode
             </button>
           </div>
-          <div class="input-row">
-            <el-input
+          <div class="mode-desc">
+            <template v-if="scanMode === 'domain'">
+              <span class="desc-icon">🔍</span>
+              <span>Subfinder → Httpx → XScan full pipeline. Enter one domain per line. Each domain creates a separate task.</span>
+            </template>
+            <template v-else>
+              <span class="desc-icon">⚡</span>
+              <span>Direct XSS scan, skip subdomain &amp; probing. Enter one URL per line (must start with http/https). All URLs go into one task. Single URL uses <code>xscan spider -u</code>, multiple uses <code>xscan spider -f</code>.</span>
+            </template>
+          </div>
+          <div class="input-area">
+            <textarea
               v-model="targetInput"
               :placeholder="inputPlaceholder"
-              size="large"
-              clearable
-              @keyup.enter="handleCreate"
-            />
-            <el-button type="primary" size="large" :loading="creating" @click="handleCreate" class="scan-btn">
-              <el-icon><VideoPlay /></el-icon>
-              Scan
-            </el-button>
+              rows="4"
+              class="target-textarea"
+              @keydown.ctrl.enter="handleCreate"
+            ></textarea>
+            <div class="input-footer">
+              <span class="input-hint">{{ targetCount }} target{{ targetCount !== 1 ? 's' : '' }} · Ctrl+Enter to submit</span>
+              <el-button type="primary" size="large" :loading="creating" @click="handleCreate" class="scan-btn">
+                <el-icon><VideoPlay /></el-icon>
+                Start Scan
+              </el-button>
+            </div>
           </div>
         </div>
       </div>
@@ -173,9 +186,13 @@ let refreshTimer = null
 
 const inputPlaceholder = computed(() =>
   scanMode.value === 'url'
-    ? 'https://example.com/search?q=test'
-    : 'example.com'
+    ? 'https://example.com/search?q=test\nhttps://example.com/page?id=1\nhttps://other.com/path'
+    : 'example.com\nexample.org\ntest.com'
 )
+
+const targetCount = computed(() => {
+  return targetInput.value.split('\n').filter(l => l.trim()).length
+})
 
 const runningCount = computed(() =>
   tasks.value.filter(t =>
@@ -204,24 +221,35 @@ async function loadTasks() {
 }
 
 async function handleCreate() {
-  const value = targetInput.value.trim()
-  if (!value) {
-    ElMessage.warning(scanMode.value === 'url' ? 'Enter a URL' : 'Enter a domain')
-    return
-  }
-  if (scanMode.value === 'url' && !/^https?:\/\//i.test(value)) {
-    ElMessage.warning('URL must start with http:// or https://')
+  const lines = targetInput.value.split('\n').map(l => l.trim()).filter(l => l)
+  if (lines.length === 0) {
+    ElMessage.warning(scanMode.value === 'url' ? 'Enter at least one URL' : 'Enter at least one domain')
     return
   }
 
-  const payload = scanMode.value === 'url'
-    ? { mode: 'url', target_url: value }
-    : { mode: 'domain', root_domain: value }
+  // Validate URLs in url mode
+  if (scanMode.value === 'url') {
+    for (const line of lines) {
+      if (!/^https?:\/\//i.test(line)) {
+        ElMessage.warning(`Invalid URL (must start with http/https): ${line}`)
+        return
+      }
+    }
+  }
+
+  const payload = {
+    mode: scanMode.value,
+    targets: lines
+  }
 
   creating.value = true
   try {
     await createTask(payload)
-    ElMessage.success('Task created')
+    if (scanMode.value === 'domain' && lines.length > 1) {
+      ElMessage.success(`${lines.length} tasks created`)
+    } else {
+      ElMessage.success('Task created')
+    }
     targetInput.value = ''
     await loadTasks()
   } catch (err) {
@@ -342,7 +370,7 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 8px 16px;
+  padding: 10px 20px;
   border-radius: 8px;
   border: 1px solid var(--border-color);
   background: var(--bg-input);
@@ -364,17 +392,77 @@ onUnmounted(() => {
   background: var(--accent-glow);
 }
 
-.input-row {
+.mode-desc {
   display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 12px 16px;
+  background: rgba(0, 212, 255, 0.04);
+  border: 1px solid rgba(0, 212, 255, 0.1);
+  border-radius: 10px;
+  font-size: 13px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+
+.mode-desc .desc-icon {
+  flex-shrink: 0;
+  font-size: 16px;
+}
+
+.mode-desc code {
+  background: rgba(0, 212, 255, 0.1);
+  color: #7dd3fc;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 12px;
+}
+
+.input-area {
+  display: flex;
+  flex-direction: column;
   gap: 12px;
 }
 
-.input-row .el-input {
-  flex: 1;
+.target-textarea {
+  width: 100%;
+  min-height: 100px;
+  padding: 14px 16px;
+  background: var(--bg-input);
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  color: var(--text-primary);
+  font-size: 14px;
+  font-family: 'JetBrains Mono', monospace, sans-serif;
+  line-height: 1.6;
+  resize: vertical;
+  outline: none;
+  transition: border-color 0.2s;
+}
+
+.target-textarea::placeholder {
+  color: var(--text-muted);
+  opacity: 0.6;
+}
+
+.target-textarea:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+
+.input-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.input-hint {
+  font-size: 12px;
+  color: var(--text-muted);
 }
 
 .scan-btn {
-  min-width: 120px;
+  min-width: 140px;
   font-weight: 600;
   border-radius: 10px;
   background: linear-gradient(135deg, #00d4ff, #6366f1) !important;
@@ -413,25 +501,10 @@ onUnmounted(() => {
   flex-shrink: 0;
 }
 
-.stat-icon.total {
-  background: rgba(99, 102, 241, 0.15);
-  color: #818cf8;
-}
-
-.stat-icon.running {
-  background: rgba(245, 158, 11, 0.15);
-  color: #fbbf24;
-}
-
-.stat-icon.completed {
-  background: rgba(16, 185, 129, 0.15);
-  color: #34d399;
-}
-
-.stat-icon.danger {
-  background: rgba(239, 68, 68, 0.15);
-  color: #f87171;
-}
+.stat-icon.total { background: rgba(99, 102, 241, 0.15); color: #818cf8; }
+.stat-icon.running { background: rgba(245, 158, 11, 0.15); color: #fbbf24; }
+.stat-icon.completed { background: rgba(16, 185, 129, 0.15); color: #34d399; }
+.stat-icon.danger { background: rgba(239, 68, 68, 0.15); color: #f87171; }
 
 .stat-number {
   font-size: 24px;
@@ -449,9 +522,7 @@ onUnmounted(() => {
 }
 
 /* Table card */
-.table-card {
-  overflow: hidden;
-}
+.table-card { overflow: hidden; }
 
 .card-header {
   display: flex;
@@ -465,13 +536,8 @@ onUnmounted(() => {
   color: var(--text-primary);
 }
 
-.refresh-btn {
-  color: var(--text-muted) !important;
-}
-
-.refresh-btn:hover {
-  color: var(--accent) !important;
-}
+.refresh-btn { color: var(--text-muted) !important; }
+.refresh-btn:hover { color: var(--accent) !important; }
 
 /* Mode badge */
 .mode-badge {
@@ -484,17 +550,9 @@ onUnmounted(() => {
   letter-spacing: 0.5px;
 }
 
-.mode-domain {
-  background: rgba(99, 102, 241, 0.15);
-  color: #818cf8;
-}
+.mode-domain { background: rgba(99, 102, 241, 0.15); color: #818cf8; }
+.mode-url { background: rgba(16, 185, 129, 0.15); color: #34d399; }
 
-.mode-url {
-  background: rgba(16, 185, 129, 0.15);
-  color: #34d399;
-}
-
-/* Target */
 .target-text {
   color: var(--text-primary);
   font-weight: 500;
@@ -512,68 +570,21 @@ onUnmounted(() => {
   font-weight: 500;
 }
 
-.status-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  flex-shrink: 0;
-}
+.status-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+.status-pending { background: rgba(100,116,139,.15); color: #94a3b8; }
+.status-pending .status-dot { background: #94a3b8; }
+.status-running { background: rgba(245,158,11,.15); color: #fbbf24; }
+.status-running .status-dot { background: #fbbf24; animation: pulse 1.5s infinite; }
+.status-completed { background: rgba(16,185,129,.15); color: #34d399; }
+.status-completed .status-dot { background: #34d399; }
+.status-failed { background: rgba(239,68,68,.15); color: #f87171; }
+.status-failed .status-dot { background: #f87171; }
+.status-cancelled { background: rgba(100,116,139,.15); color: #64748b; }
+.status-cancelled .status-dot { background: #64748b; }
 
-.status-pending {
-  background: rgba(100, 116, 139, 0.15);
-  color: #94a3b8;
-}
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
 
-.status-pending .status-dot {
-  background: #94a3b8;
-}
-
-.status-running {
-  background: rgba(245, 158, 11, 0.15);
-  color: #fbbf24;
-}
-
-.status-running .status-dot {
-  background: #fbbf24;
-  animation: pulse 1.5s infinite;
-}
-
-.status-completed {
-  background: rgba(16, 185, 129, 0.15);
-  color: #34d399;
-}
-
-.status-completed .status-dot {
-  background: #34d399;
-}
-
-.status-failed {
-  background: rgba(239, 68, 68, 0.15);
-  color: #f87171;
-}
-
-.status-failed .status-dot {
-  background: #f87171;
-}
-
-.status-cancelled {
-  background: rgba(100, 116, 139, 0.15);
-  color: #64748b;
-}
-
-.status-cancelled .status-dot {
-  background: #64748b;
-}
-
-@keyframes pulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.4; }
-}
-
-.step-text {
-  font-size: 13px;
-  color: var(--text-secondary);
-}
+.step-text { font-size: 13px; color: var(--text-secondary); }
 
 .xss-badge {
   display: inline-flex;
@@ -583,26 +594,17 @@ onUnmounted(() => {
   height: 22px;
   padding: 0 6px;
   border-radius: 6px;
-  background: rgba(239, 68, 68, 0.2);
+  background: rgba(239,68,68,.2);
   color: #f87171;
   font-size: 12px;
   font-weight: 700;
 }
 
-.text-muted {
-  color: var(--text-muted);
-}
-
-.time-text {
-  font-size: 13px;
-  color: var(--text-muted);
-}
+.text-muted { color: var(--text-muted); }
+.time-text { font-size: 13px; color: var(--text-muted); }
 
 /* Action buttons */
-.action-btns {
-  display: flex;
-  gap: 6px;
-}
+.action-btns { display: flex; gap: 6px; }
 
 .action-btn {
   width: 32px;
@@ -618,36 +620,14 @@ onUnmounted(() => {
   font-size: 14px;
 }
 
-.action-btn.view {
-  color: var(--accent);
-}
-
-.action-btn.view:hover {
-  background: var(--accent-glow);
-  border-color: var(--accent);
-}
-
-.action-btn.delete {
-  color: var(--text-muted);
-}
-
-.action-btn.delete:hover {
-  color: #f87171;
-  background: rgba(239, 68, 68, 0.1);
-  border-color: rgba(239, 68, 68, 0.3);
-}
+.action-btn.view { color: var(--accent); }
+.action-btn.view:hover { background: var(--accent-glow); border-color: var(--accent); }
+.action-btn.delete { color: var(--text-muted); }
+.action-btn.delete:hover { color: #f87171; background: rgba(239,68,68,.1); border-color: rgba(239,68,68,.3); }
 
 @media (max-width: 768px) {
-  .stats-row {
-    grid-template-columns: repeat(2, 1fr);
-  }
-
-  .input-row {
-    flex-direction: column;
-  }
-
-  .scan-btn {
-    min-width: auto;
-  }
+  .stats-row { grid-template-columns: repeat(2, 1fr); }
+  .input-footer { flex-direction: column; gap: 8px; align-items: flex-start; }
+  .scan-btn { min-width: auto; width: 100%; }
 }
 </style>
