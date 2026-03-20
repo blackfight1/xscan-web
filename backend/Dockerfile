@@ -2,7 +2,7 @@
 FROM golang:1.21-alpine AS build
 RUN apk add --no-cache gcc musl-dev
 WORKDIR /app
-COPY go.mod go.sum ./
+COPY go.mod ./
 RUN go mod download
 COPY . .
 RUN CGO_ENABLED=1 go build -o xscan-web .

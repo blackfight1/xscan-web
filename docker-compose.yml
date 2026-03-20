@@ -7,8 +7,8 @@ services:
       dockerfile: Dockerfile
     ports:
       - "80:80"
-    depends_on:
-      - backend
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     restart: unless-stopped
     networks:
       - xscan-net
@@ -23,6 +23,8 @@ services:
       - ./xscan:/app/xscan
       - ./tools:/app/tools
       - ./backend/config.json:/app/config.json
+    ports:
+      - "8080:8080"
     restart: unless-stopped
     networks:
       - xscan-net

@@ -1,110 +1,197 @@
-#!/bin/bash
-# XScan Web 一键部署脚本
-# 使用方法: chmod +x deploy.sh && ./deploy.sh
+#!/usr/bin/env bash
+# XScan Web deployment helper
+# Default mode fits this project now:
+#   frontend in Docker + backend/xscan on host
 
-set -e
+set -euo pipefail
+
+MODE="hybrid"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ./deploy.sh [--mode hybrid|host|docker]
+
+Modes:
+  hybrid (default): frontend in Docker, backend/xscan on host
+  host:             frontend static files + backend all on host
+  docker:           both frontend/backend via docker compose
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --mode)
+      MODE="${2:-}"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "[!] Unknown argument: $1"
+      usage
+      exit 1
+      ;;
+  esac
+done
+
+if [[ "$MODE" != "hybrid" && "$MODE" != "host" && "$MODE" != "docker" ]]; then
+  echo "[!] Invalid mode: $MODE"
+  usage
+  exit 1
+fi
 
 echo "=========================================="
-echo "  XScan Web 部署脚本"
+echo "  XScan Web Deploy Script"
+echo "  Mode: $MODE"
 echo "=========================================="
 
-# 创建必要目录
-echo "[1/6] 创建目录结构..."
-mkdir -p data results tools xscan
+prepare_dirs() {
+  echo "[1/5] Preparing directories..."
+  mkdir -p data results tools xscan
+}
 
-# 检查 xscan 是否存在
-if [ ! -f "./xscan/xscan" ]; then
-    echo "[!] 请将 xscan 二进制文件放到 ./xscan/ 目录下"
-    echo "    例如: cp /path/to/xscan ./xscan/xscan"
-    echo "    同时复制 config.yaml 和 dict 目录"
-
-    # 如果 xscan_3.6.5_linux_amd64 目录存在，自动复制
-    if [ -d "./xscan_3.6.5_linux_amd64" ]; then
-        echo "[*] 检测到 xscan_3.6.5_linux_amd64 目录，自动复制..."
-        cp -r ./xscan_3.6.5_linux_amd64/* ./xscan/
-        chmod +x ./xscan/xscan
-        echo "[✓] xscan 已复制到 ./xscan/"
-    fi
-fi
-
-# 检查 subfinder
-echo "[2/6] 检查工具..."
-if ! command -v subfinder &> /dev/null; then
-    echo "[*] 安装 subfinder..."
-    if command -v go &> /dev/null; then
-        go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
-        cp $(go env GOPATH)/bin/subfinder ./tools/ 2>/dev/null || true
+prepare_xscan() {
+  echo "[2/5] Checking xscan..."
+  if [[ ! -f "./xscan/xscan" ]]; then
+    if [[ -d "./xscan_3.6.5_linux_amd64" ]]; then
+      echo "[*] Found ./xscan_3.6.5_linux_amd64, copying into ./xscan ..."
+      cp -r ./xscan_3.6.5_linux_amd64/* ./xscan/
     else
-        echo "[!] subfinder 未安装，请手动安装: https://github.com/projectdiscovery/subfinder"
+      echo "[!] Missing ./xscan/xscan"
+      echo "    Put xscan binary/config.yaml/dict in ./xscan/"
+      exit 1
     fi
-else
-    echo "[✓] subfinder 已安装"
-    cp $(which subfinder) ./tools/ 2>/dev/null || true
-fi
+  fi
 
-# 检查 httpx
-if ! command -v httpx &> /dev/null; then
-    echo "[*] 安装 httpx..."
-    if command -v go &> /dev/null; then
-        go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
-        cp $(go env GOPATH)/bin/httpx ./tools/ 2>/dev/null || true
-    else
-        echo "[!] httpx 未安装，请手动安装: https://github.com/projectdiscovery/httpx"
-    fi
-else
-    echo "[✓] httpx 已安装"
-    cp $(which httpx) ./tools/ 2>/dev/null || true
-fi
+  chmod +x ./xscan/xscan
 
-# 构建后端
-echo "[3/6] 构建后端..."
-cd backend
-if [ ! -f "go.sum" ]; then
+  if [[ ! -f "./xscan/config.yaml" ]]; then
+    echo "[!] Warning: ./xscan/config.yaml not found"
+  fi
+  if [[ ! -e "./xscan/dict" ]]; then
+    echo "[!] Warning: ./xscan/dict not found"
+  fi
+}
+
+prepare_tools() {
+  echo "[3/5] Checking tools..."
+  if command -v subfinder >/dev/null 2>&1; then
+    cp "$(command -v subfinder)" ./tools/ 2>/dev/null || true
+    echo "[✓] subfinder found"
+  else
+    echo "[!] subfinder not found (pipeline will fallback to root domain)"
+  fi
+
+  if command -v httpx >/dev/null 2>&1; then
+    cp "$(command -v httpx)" ./tools/ 2>/dev/null || true
+    echo "[✓] httpx found"
+  else
+    echo "[!] httpx not found (pipeline will fallback to https://domain)"
+  fi
+}
+
+ensure_config() {
+  echo "[4/5] Checking config..."
+  if [[ ! -f "./config.json" ]]; then
+    cp ./backend/config.json ./config.json
+    echo "[!] Generated ./config.json from template, please update auth_token"
+  fi
+}
+
+build_backend_host() {
+  echo "[5/5] Building backend binary..."
+  if ! command -v go >/dev/null 2>&1; then
+    echo "[!] Go is required for host/hybrid mode build"
+    exit 1
+  fi
+  (
+    cd backend
     go mod tidy
-fi
-CGO_ENABLED=1 go build -o ../xscan-web-server .
-cd ..
-echo "[✓] 后端构建完成"
+    CGO_ENABLED=1 go build -o ../xscan-web-server .
+  )
+  echo "[✓] Built ./xscan-web-server"
+}
 
-# 构建前端
-echo "[4/6] 构建前端..."
-cd frontend
-npm install
-npm run build
-cd ..
+build_frontend_static() {
+  echo "[*] Building frontend static files (host mode)..."
+  if ! command -v npm >/dev/null 2>&1; then
+    echo "[!] npm is required for host mode"
+    exit 1
+  fi
+  (
+    cd frontend
+    npm install
+    npm run build
+  )
+  rm -rf static
+  cp -r frontend/dist static
+  echo "[✓] Frontend static files synced to ./static"
+}
 
-# 复制前端到后端 static 目录
-echo "[5/6] 部署前端静态文件..."
-rm -rf static
-cp -r frontend/dist static
-echo "[✓] 前端部署完成"
+print_next_steps_hybrid() {
+  cat <<'EOF'
 
-# 生成配置
-echo "[6/6] 配置检查..."
-if [ ! -f "config.json" ]; then
-    cp backend/config.json config.json
-    echo "[!] 已生成默认 config.json，请修改 auth_token"
-fi
+==========================================
+Deploy completed (hybrid mode)
+==========================================
+Next:
+  1) Start backend on host:
+       ./xscan-web-server
+  2) Start frontend container:
+       docker compose up -d frontend
 
-echo ""
-echo "=========================================="
-echo "  部署完成！"
-echo "=========================================="
-echo ""
-echo "目录结构:"
-echo "  ./xscan-web-server   - 后端可执行文件"
-echo "  ./config.json        - 配置文件"
-echo "  ./static/            - 前端静态文件"
-echo "  ./xscan/             - xscan 工具"
-echo "  ./tools/             - subfinder, httpx 等"
-echo "  ./data/              - SQLite 数据库"
-echo "  ./results/           - 扫描结果"
-echo ""
-echo "启动方式:"
-echo "  ./xscan-web-server"
-echo ""
-echo "或使用 Docker Compose:"
-echo "  docker-compose up -d"
-echo ""
-echo "注意: 请修改 config.json 中的 auth_token"
-echo "=========================================="
+Notes:
+  - frontend will proxy /api to host.docker.internal:8080
+  - ensure backend is listening on 0.0.0.0:8080
+  - update auth_token in ./config.json
+==========================================
+EOF
+}
+
+print_next_steps_host() {
+  cat <<'EOF'
+
+==========================================
+Deploy completed (host mode)
+==========================================
+Start:
+  ./xscan-web-server
+==========================================
+EOF
+}
+
+print_next_steps_docker() {
+  cat <<'EOF'
+
+==========================================
+Deploy completed (docker mode prep)
+==========================================
+Run:
+  docker compose up -d --build
+==========================================
+EOF
+}
+
+prepare_dirs
+prepare_xscan
+prepare_tools
+ensure_config
+
+case "$MODE" in
+  hybrid)
+    build_backend_host
+    print_next_steps_hybrid
+    ;;
+  host)
+    build_backend_host
+    build_frontend_static
+    print_next_steps_host
+    ;;
+  docker)
+    print_next_steps_docker
+    ;;
+esac
+

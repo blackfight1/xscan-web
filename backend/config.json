@@ -5,5 +5,5 @@
     "tools_dir": "./tools",
     "results_dir": "./results",
     "max_concurrent": 2,
-    "auth_token": "your-secret-token-here"
+    "auth_token": ""
 }

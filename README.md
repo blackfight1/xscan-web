@@ -51,7 +51,7 @@ ssh user@your-vps
 # 3. 运行部署脚本
 cd /opt/xscan-web
 chmod +x deploy.sh
-./deploy.sh
+./deploy.sh --mode hybrid
 
 # 4. 修改配置
 vim config.json   # 修改 auth_token
@@ -59,6 +59,11 @@ vim config.json   # 修改 auth_token
 # 5. 启动服务
 ./xscan-web-server
 ```
+
+`deploy.sh` 支持三种模式：
+- `--mode hybrid`（默认）：前端 Docker + 后端/工具在主机运行
+- `--mode host`：前后端都在主机运行
+- `--mode docker`：前后端都走 Docker Compose
 
 ### 方式二：Docker Compose
 

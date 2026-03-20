@@ -397,18 +397,33 @@ func (s *Scanner) runXscan(taskID string, urls []string, taskDir string) (int, e
 	os.MkdirAll(xssOutputDir, 0755)
 
 	totalXss := 0
+	if len(urls) == 0 {
+		return 0, nil
+	}
 
-	for i, url := range urls {
-		log.Printf("[Task %s] Scanning (%d/%d): %s", taskID, i+1, len(urls), url)
-		s.updateTaskStatus(taskID, models.StatusScanning,
-			fmt.Sprintf("正在扫描 (%d/%d): %s", i+1, len(urls), url))
+	// 先将存活URL写入文件，再通过 spider -f 批量扫描（当前不做分组）。
+	targetsFile := filepath.Join(taskDir, "xscan_targets.txt")
+	if err := os.WriteFile(targetsFile, []byte(strings.Join(urls, "\n")), 0644); err != nil {
+		return 0, fmt.Errorf("failed to write xscan targets file: %w", err)
+	}
 
-		cmd := exec.Command(s.xscanPath, "spider", "-u", url, "--output-dir", xssOutputDir)
-		cmd.Dir = filepath.Dir(s.xscanPath)
-		output, err := cmd.CombinedOutput()
+	log.Printf("[Task %s] Scanning %d URLs by file: %s", taskID, len(urls), targetsFile)
+	s.updateTaskStatus(taskID, models.StatusScanning,
+		fmt.Sprintf("正在批量扫描，共 %d 个URL", len(urls)))
+
+	cmd := exec.Command(s.xscanPath, "spider", "-f", targetsFile, "--output-dir", xssOutputDir)
+	cmd.Dir = filepath.Dir(s.xscanPath)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		// 与文档命令保持兼容：若版本不支持 -f，回退到 -file。
+		if strings.Contains(string(output), "flag provided but not defined: -f") {
+			log.Printf("[Task %s] -f not supported, fallback to -file", taskID)
+			cmd = exec.Command(s.xscanPath, "spider", "-file", targetsFile, "--output-dir", xssOutputDir)
+			cmd.Dir = filepath.Dir(s.xscanPath)
+			output, err = cmd.CombinedOutput()
+		}
 		if err != nil {
-			log.Printf("[Task %s] xscan error for %s: %v, output: %s", taskID, url, err, string(output))
-			continue
+			return 0, fmt.Errorf("xscan spider file scan failed: %w, output: %s", err, string(output))
 		}
 	}
 
