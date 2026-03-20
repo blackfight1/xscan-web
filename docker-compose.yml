@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+    networks:
+      - xscan-net
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    volumes:
+      - ./data:/app/data
+      - ./results:/app/results
+      - ./xscan:/app/xscan
+      - ./tools:/app/tools
+      - ./backend/config.json:/app/config.json
+    restart: unless-stopped
+    networks:
+      - xscan-net
+
+networks:
+  xscan-net:
+    driver: bridge

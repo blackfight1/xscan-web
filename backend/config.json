@@ -1,0 +1,9 @@
+{
+    "port": 8080,
+    "db_path": "./data/xscan.db",
+    "xscan_path": "./xscan/xscan",
+    "tools_dir": "./tools",
+    "results_dir": "./results",
+    "max_concurrent": 2,
+    "auth_token": "your-secret-token-here"
+}
