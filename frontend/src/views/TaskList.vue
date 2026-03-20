@@ -1,11 +1,15 @@
 <template>
   <div class="task-list">
-    <!-- Create Task Card -->
     <el-card class="create-card" shadow="hover">
       <div class="create-form">
+        <el-select v-model="scanMode" size="large" class="mode-select">
+          <el-option label="Domain mode" value="domain" />
+          <el-option label="Single URL mode" value="url" />
+        </el-select>
+
         <el-input
-          v-model="newDomain"
-          placeholder="输入根域名，例如 example.com"
+          v-model="targetInput"
+          :placeholder="inputPlaceholder"
           size="large"
           clearable
           @keyup.enter="handleCreate"
@@ -14,70 +18,85 @@
             <el-icon><Search /></el-icon>
           </template>
         </el-input>
-        <el-button type="primary" size="large" @click="handleCreate" :loading="creating">
+
+        <el-button type="primary" size="large" :loading="creating" @click="handleCreate">
           <el-icon><VideoPlay /></el-icon>
-          开始扫描
+          Start
         </el-button>
       </div>
     </el-card>
 
-    <!-- Stats -->
     <div class="stats-row">
       <el-card shadow="hover" class="stat-card">
         <div class="stat-content">
           <div class="stat-number">{{ tasks.length }}</div>
-          <div class="stat-label">总任务数</div>
+          <div class="stat-label">Total Tasks</div>
         </div>
       </el-card>
+
       <el-card shadow="hover" class="stat-card">
         <div class="stat-content">
           <div class="stat-number running">{{ runningCount }}</div>
-          <div class="stat-label">运行中</div>
+          <div class="stat-label">Running</div>
         </div>
       </el-card>
+
       <el-card shadow="hover" class="stat-card">
         <div class="stat-content">
           <div class="stat-number success">{{ completedCount }}</div>
-          <div class="stat-label">已完成</div>
+          <div class="stat-label">Completed</div>
         </div>
       </el-card>
+
       <el-card shadow="hover" class="stat-card">
         <div class="stat-content">
           <div class="stat-number danger">{{ totalXss }}</div>
-          <div class="stat-label">发现XSS</div>
+          <div class="stat-label">XSS Found</div>
         </div>
       </el-card>
     </div>
 
-    <!-- Task Table -->
     <el-card shadow="hover">
       <template #header>
         <div class="card-header">
-          <span>扫描任务列表</span>
+          <span>Scan Tasks</span>
           <el-button text @click="loadTasks">
             <el-icon><Refresh /></el-icon>
-            刷新
+            Refresh
           </el-button>
         </div>
       </template>
 
-      <el-table :data="tasks" stripe v-loading="loading" empty-text="暂无任务">
+      <el-table :data="tasks" stripe v-loading="loading" empty-text="No tasks">
         <el-table-column prop="id" label="ID" width="100" />
-        <el-table-column prop="root_domain" label="根域名" min-width="180" />
-        <el-table-column label="状态" width="160">
+
+        <el-table-column label="Mode" width="130" align="center">
+          <template #default="{ row }">
+            <el-tag :type="row.scan_mode === 'url' ? 'success' : 'info'" effect="light">
+              {{ row.scan_mode === 'url' ? 'URL' : 'Domain' }}
+            </el-tag>
+          </template>
+        </el-table-column>
+
+        <el-table-column prop="root_domain" label="Target" min-width="240" />
+
+        <el-table-column label="Status" width="160">
           <template #default="{ row }">
             <el-tag :type="statusType(row.status)" effect="light">
               {{ statusText(row.status) }}
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="进度" min-width="200">
+
+        <el-table-column label="Step" min-width="220">
           <template #default="{ row }">
             <span class="step-text">{{ row.current_step }}</span>
           </template>
         </el-table-column>
-        <el-table-column prop="subdomain_count" label="子域名" width="90" align="center" />
-        <el-table-column prop="alive_count" label="存活" width="80" align="center" />
+
+        <el-table-column prop="subdomain_count" label="Sub" width="80" align="center" />
+        <el-table-column prop="alive_count" label="Alive" width="80" align="center" />
+
         <el-table-column label="XSS" width="80" align="center">
           <template #default="{ row }">
             <el-tag v-if="row.xss_count > 0" type="danger" effect="dark" size="small">
@@ -86,22 +105,25 @@
             <span v-else>0</span>
           </template>
         </el-table-column>
-        <el-table-column label="创建时间" width="170">
+
+        <el-table-column label="Created" width="170">
           <template #default="{ row }">
             {{ formatTime(row.created_at) }}
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="150" fixed="right">
+
+        <el-table-column label="Actions" width="150" fixed="right">
           <template #default="{ row }">
             <el-button link type="primary" @click="viewDetail(row.id)">
               <el-icon><View /></el-icon>
-              详情
+              Detail
             </el-button>
-            <el-popconfirm title="确定删除此任务？" @confirm="handleDelete(row.id)">
+
+            <el-popconfirm title="Delete this task?" @confirm="handleDelete(row.id)">
               <template #reference>
                 <el-button link type="danger">
                   <el-icon><Delete /></el-icon>
-                  删除
+                  Delete
                 </el-button>
               </template>
             </el-popconfirm>
@@ -122,50 +144,64 @@ const router = useRouter()
 const tasks = ref([])
 const loading = ref(false)
 const creating = ref(false)
-const newDomain = ref('')
+const scanMode = ref('domain')
+const targetInput = ref('')
 let refreshTimer = null
 
+const inputPlaceholder = computed(() => {
+  if (scanMode.value === 'url') {
+    return 'Enter a full URL, e.g. https://example.com/search?q=1'
+  }
+  return 'Enter root domain, e.g. example.com'
+})
+
 const runningCount = computed(() =>
-  tasks.value.filter(t =>
+  tasks.value.filter((t) =>
     ['pending', 'subdomain_collecting', 'httpx_probing', 'xss_scanning'].includes(t.status)
   ).length
 )
 
-const completedCount = computed(() =>
-  tasks.value.filter(t => t.status === 'completed').length
-)
+const completedCount = computed(() => tasks.value.filter((t) => t.status === 'completed').length)
 
-const totalXss = computed(() =>
-  tasks.value.reduce((sum, t) => sum + (t.xss_count || 0), 0)
-)
+const totalXss = computed(() => tasks.value.reduce((sum, t) => sum + (t.xss_count || 0), 0))
 
 async function loadTasks() {
   loading.value = true
   try {
     const data = await getTasks()
     tasks.value = data.tasks || []
-  } catch (err) {
-    ElMessage.error('获取任务列表失败')
+  } catch {
+    ElMessage.error('Failed to load tasks')
   } finally {
     loading.value = false
   }
 }
 
 async function handleCreate() {
-  const domain = newDomain.value.trim()
-  if (!domain) {
-    ElMessage.warning('请输入根域名')
+  const value = targetInput.value.trim()
+  if (!value) {
+    ElMessage.warning(scanMode.value === 'url' ? 'Please enter URL' : 'Please enter root domain')
     return
   }
 
+  if (scanMode.value === 'url' && !/^https?:\/\//i.test(value)) {
+    ElMessage.warning('URL must start with http:// or https://')
+    return
+  }
+
+  const payload =
+    scanMode.value === 'url'
+      ? { mode: 'url', target_url: value }
+      : { mode: 'domain', root_domain: value }
+
   creating.value = true
   try {
-    await createTask(domain)
-    ElMessage.success('任务创建成功')
-    newDomain.value = ''
+    await createTask(payload)
+    ElMessage.success('Task created')
+    targetInput.value = ''
     await loadTasks()
   } catch (err) {
-    ElMessage.error('创建任务失败: ' + (err.response?.data?.error || err.message))
+    ElMessage.error('Create task failed: ' + (err.response?.data?.error || err.message))
   } finally {
     creating.value = false
   }
@@ -174,10 +210,10 @@ async function handleCreate() {
 async function handleDelete(id) {
   try {
     await deleteTask(id)
-    ElMessage.success('任务删除成功')
+    ElMessage.success('Task deleted')
     await loadTasks()
-  } catch (err) {
-    ElMessage.error('删除失败')
+  } catch {
+    ElMessage.error('Delete failed')
   }
 }
 
@@ -200,13 +236,13 @@ function statusType(status) {
 
 function statusText(status) {
   const map = {
-    pending: '等待中',
-    subdomain_collecting: '收集子域名',
-    httpx_probing: '探测存活',
-    xss_scanning: 'XSS扫描中',
-    completed: '已完成',
-    failed: '失败',
-    cancelled: '已取消',
+    pending: 'Pending',
+    subdomain_collecting: 'Collecting subdomains',
+    httpx_probing: 'Probing alive URLs',
+    xss_scanning: 'Scanning XSS',
+    completed: 'Completed',
+    failed: 'Failed',
+    cancelled: 'Cancelled',
   }
   return map[status] || status
 }
@@ -218,7 +254,6 @@ function formatTime(time) {
 
 onMounted(() => {
   loadTasks()
-  // Auto refresh every 10 seconds
   refreshTimer = setInterval(loadTasks, 10000)
 })
 
@@ -245,6 +280,10 @@ onUnmounted(() => {
 .create-form {
   display: flex;
   gap: 12px;
+}
+
+.mode-select {
+  width: 180px;
 }
 
 .create-form .el-input {
@@ -305,6 +344,10 @@ onUnmounted(() => {
 
   .create-form {
     flex-direction: column;
+  }
+
+  .mode-select {
+    width: 100%;
   }
 }
 </style>

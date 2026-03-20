@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -80,15 +81,27 @@ func (s *Scanner) Stop() {
 	close(s.quit)
 }
 
-// CreateTask creates a new task and enqueues it
-func (s *Scanner) CreateTask(rootDomain string) (*models.Task, error) {
+// CreateTask creates a new task and enqueues it.
+func (s *Scanner) CreateTask(scanMode, rootDomain, targetURL string) (*models.Task, error) {
+	mode := strings.TrimSpace(strings.ToLower(scanMode))
+	if mode == "" {
+		mode = models.ScanModeDomain
+	}
+
+	rootDomain = strings.TrimSpace(rootDomain)
+	targetURL = strings.TrimSpace(targetURL)
+	displayTarget := rootDomain
+	if mode == models.ScanModeURL {
+		displayTarget = targetURL
+	}
+
 	id := uuid.New().String()[:8]
 	now := time.Now()
 
 	_, err := database.DB.Exec(
-		`INSERT INTO tasks (id, root_domain, status, current_step, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?)`,
-		id, rootDomain, models.StatusPending, "等待执行", now, now,
+		`INSERT INTO tasks (id, scan_mode, root_domain, target_url, status, current_step, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		id, mode, displayTarget, targetURL, models.StatusPending, "waiting", now, now,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create task: %w", err)
@@ -96,30 +109,31 @@ func (s *Scanner) CreateTask(rootDomain string) (*models.Task, error) {
 
 	task := &models.Task{
 		ID:          id,
-		RootDomain:  rootDomain,
+		ScanMode:    mode,
+		RootDomain:  displayTarget,
+		TargetURL:   targetURL,
 		Status:      models.StatusPending,
-		CurrentStep: "等待执行",
+		CurrentStep: "waiting",
 		CreatedAt:   now,
 		UpdatedAt:   now,
 	}
 
-	// Enqueue task
 	s.taskQueue <- id
-
 	return task, nil
 }
 
-// GetTask returns a task by ID
+// GetTask returns a task by ID.
 func (s *Scanner) GetTask(id string) (*models.Task, error) {
 	task := &models.Task{}
 	var finishedAt sql.NullTime
 
 	err := database.DB.QueryRow(
-		`SELECT id, root_domain, status, subdomain_count, alive_count, xss_count,
+		`SELECT id, scan_mode, root_domain, target_url, status, subdomain_count, alive_count, xss_count,
 		        current_step, error_message, created_at, updated_at, finished_at
-		 FROM tasks WHERE id = ?`, id,
+		 FROM tasks WHERE id = ?`,
+		id,
 	).Scan(
-		&task.ID, &task.RootDomain, &task.Status,
+		&task.ID, &task.ScanMode, &task.RootDomain, &task.TargetURL, &task.Status,
 		&task.SubdomainCount, &task.AliveCount, &task.XssCount,
 		&task.CurrentStep, &task.ErrorMessage,
 		&task.CreatedAt, &task.UpdatedAt, &finishedAt,
@@ -134,10 +148,10 @@ func (s *Scanner) GetTask(id string) (*models.Task, error) {
 	return task, nil
 }
 
-// GetTasks returns all tasks
+// GetTasks returns all tasks.
 func (s *Scanner) GetTasks() ([]models.Task, error) {
 	rows, err := database.DB.Query(
-		`SELECT id, root_domain, status, subdomain_count, alive_count, xss_count,
+		`SELECT id, scan_mode, root_domain, target_url, status, subdomain_count, alive_count, xss_count,
 		        current_step, error_message, created_at, updated_at, finished_at
 		 FROM tasks ORDER BY created_at DESC`,
 	)
@@ -151,7 +165,7 @@ func (s *Scanner) GetTasks() ([]models.Task, error) {
 		var task models.Task
 		var finishedAt sql.NullTime
 		err := rows.Scan(
-			&task.ID, &task.RootDomain, &task.Status,
+			&task.ID, &task.ScanMode, &task.RootDomain, &task.TargetURL, &task.Status,
 			&task.SubdomainCount, &task.AliveCount, &task.XssCount,
 			&task.CurrentStep, &task.ErrorMessage,
 			&task.CreatedAt, &task.UpdatedAt, &finishedAt,
@@ -167,18 +181,15 @@ func (s *Scanner) GetTasks() ([]models.Task, error) {
 	return tasks, nil
 }
 
-// GetTaskDetail returns task with all related data
+// GetTaskDetail returns task with all related data.
 func (s *Scanner) GetTaskDetail(id string) (*models.TaskDetailResponse, error) {
 	task, err := s.GetTask(id)
 	if err != nil {
 		return nil, err
 	}
 
-	detail := &models.TaskDetailResponse{
-		Task: *task,
-	}
+	detail := &models.TaskDetailResponse{Task: *task}
 
-	// Get subdomains
 	rows, err := database.DB.Query("SELECT id, task_id, domain, created_at FROM subdomains WHERE task_id = ?", id)
 	if err == nil {
 		defer rows.Close()
@@ -189,7 +200,6 @@ func (s *Scanner) GetTaskDetail(id string) (*models.TaskDetailResponse, error) {
 		}
 	}
 
-	// Get alive URLs
 	rows2, err := database.DB.Query("SELECT id, task_id, url, status_code, title, created_at FROM alive_urls WHERE task_id = ?", id)
 	if err == nil {
 		defer rows2.Close()
@@ -200,7 +210,6 @@ func (s *Scanner) GetTaskDetail(id string) (*models.TaskDetailResponse, error) {
 		}
 	}
 
-	// Get XSS results
 	rows3, err := database.DB.Query("SELECT id, task_id, url, payload, param, position, report_content, created_at FROM xss_results WHERE task_id = ?", id)
 	if err == nil {
 		defer rows3.Close()
@@ -214,9 +223,8 @@ func (s *Scanner) GetTaskDetail(id string) (*models.TaskDetailResponse, error) {
 	return detail, nil
 }
 
-// DeleteTask deletes a task and its results
+// DeleteTask deletes a task and its results.
 func (s *Scanner) DeleteTask(id string) error {
-	// Delete related data first
 	database.DB.Exec("DELETE FROM xss_results WHERE task_id = ?", id)
 	database.DB.Exec("DELETE FROM alive_urls WHERE task_id = ?", id)
 	database.DB.Exec("DELETE FROM subdomains WHERE task_id = ?", id)
@@ -226,18 +234,14 @@ func (s *Scanner) DeleteTask(id string) error {
 		return err
 	}
 
-	// Clean up result directory
 	taskDir := filepath.Join(s.resultsDir, id)
 	os.RemoveAll(taskDir)
-
 	return nil
 }
 
-// GetReport returns the XSS report markdown content
+// GetReport returns the XSS report markdown content.
 func (s *Scanner) GetReport(taskID string) (string, error) {
 	taskDir := filepath.Join(s.resultsDir, taskID)
-
-	// Find *_xss.md files
 	matches, err := filepath.Glob(filepath.Join(taskDir, "*_xss.md"))
 	if err != nil || len(matches) == 0 {
 		return "", fmt.Errorf("no report found for task %s", taskID)
@@ -256,7 +260,7 @@ func (s *Scanner) GetReport(taskID string) (string, error) {
 	return allContent.String(), nil
 }
 
-// executeTask runs the full scan pipeline
+// executeTask runs either domain workflow or URL workflow.
 func (s *Scanner) executeTask(taskID string) {
 	log.Printf("[Task %s] Starting execution", taskID)
 
@@ -269,15 +273,44 @@ func (s *Scanner) executeTask(taskID string) {
 	taskDir := filepath.Join(s.resultsDir, taskID)
 	os.MkdirAll(taskDir, 0755)
 
-	// Step 1: Subdomain collection
-	s.updateTaskStatus(taskID, models.StatusSubdomain, "正在收集子域名...")
-	subdomains, err := s.collectSubdomains(task.RootDomain, taskDir)
-	if err != nil {
-		s.failTask(taskID, fmt.Sprintf("子域名收集失败: %v", err))
+	mode := strings.TrimSpace(strings.ToLower(task.ScanMode))
+	if mode == "" {
+		mode = models.ScanModeDomain
+	}
+
+	if mode == models.ScanModeURL {
+		targetURL := strings.TrimSpace(task.TargetURL)
+		if targetURL == "" {
+			targetURL = strings.TrimSpace(task.RootDomain)
+		}
+		if !isValidHTTPURL(targetURL) {
+			s.failTask(taskID, fmt.Sprintf("invalid target_url: %s", targetURL))
+			return
+		}
+
+		s.updateTaskStatus(taskID, models.StatusScanning, "running xscan spider -u")
+		database.DB.Exec("INSERT INTO alive_urls (task_id, url) VALUES (?, ?)", taskID, targetURL)
+		s.updateTaskCount(taskID, "alive_count", 1)
+
+		xssCount, err := s.runXscanSingleURL(taskID, targetURL, taskDir)
+		if err != nil {
+			s.failTask(taskID, fmt.Sprintf("xscan spider -u failed: %v", err))
+			return
+		}
+
+		s.updateTaskCount(taskID, "xss_count", xssCount)
+		s.completeTask(taskID)
+		log.Printf("[Task %s] Completed URL mode. Found %d XSS vulnerabilities", taskID, xssCount)
 		return
 	}
 
-	// Save subdomains to DB
+	s.updateTaskStatus(taskID, models.StatusSubdomain, "collecting subdomains")
+	subdomains, err := s.collectSubdomains(task.RootDomain, taskDir)
+	if err != nil {
+		s.failTask(taskID, fmt.Sprintf("subdomain collection failed: %v", err))
+		return
+	}
+
 	for _, sub := range subdomains {
 		database.DB.Exec("INSERT INTO subdomains (task_id, domain) VALUES (?, ?)", taskID, sub)
 	}
@@ -285,19 +318,16 @@ func (s *Scanner) executeTask(taskID string) {
 	log.Printf("[Task %s] Found %d subdomains", taskID, len(subdomains))
 
 	if len(subdomains) == 0 {
-		// If no subdomains found, use the root domain directly
 		subdomains = []string{task.RootDomain}
 	}
 
-	// Step 2: HTTP alive detection
-	s.updateTaskStatus(taskID, models.StatusHttpx, "正在探测存活主机...")
+	s.updateTaskStatus(taskID, models.StatusHttpx, "probing alive hosts")
 	aliveURLs, err := s.probeAlive(subdomains, taskDir)
 	if err != nil {
-		s.failTask(taskID, fmt.Sprintf("存活探测失败: %v", err))
+		s.failTask(taskID, fmt.Sprintf("httpx probe failed: %v", err))
 		return
 	}
 
-	// Save alive URLs to DB
 	for _, u := range aliveURLs {
 		database.DB.Exec("INSERT INTO alive_urls (task_id, url) VALUES (?, ?)", taskID, u)
 	}
@@ -305,57 +335,57 @@ func (s *Scanner) executeTask(taskID string) {
 	log.Printf("[Task %s] Found %d alive URLs", taskID, len(aliveURLs))
 
 	if len(aliveURLs) == 0 {
-		s.failTask(taskID, "未发现存活的URL")
+		s.failTask(taskID, "no alive URL found")
 		return
 	}
 
-	// Step 3: XSS scanning with xscan
-	s.updateTaskStatus(taskID, models.StatusScanning, "正在进行XSS扫描...")
+	s.updateTaskStatus(taskID, models.StatusScanning, "running xscan spider -f")
 	xssCount, err := s.runXscan(taskID, aliveURLs, taskDir)
 	if err != nil {
-		s.failTask(taskID, fmt.Sprintf("XSS扫描失败: %v", err))
+		s.failTask(taskID, fmt.Sprintf("xscan spider -f failed: %v", err))
 		return
 	}
 
 	s.updateTaskCount(taskID, "xss_count", xssCount)
-
-	// Step 4: Complete
-	now := time.Now()
-	database.DB.Exec(
-		`UPDATE tasks SET status = ?, current_step = ?, updated_at = ?, finished_at = ? WHERE id = ?`,
-		models.StatusCompleted, "扫描完成", now, now, taskID,
-	)
-	log.Printf("[Task %s] Completed. Found %d XSS vulnerabilities", taskID, xssCount)
+	s.completeTask(taskID)
+	log.Printf("[Task %s] Completed domain mode. Found %d XSS vulnerabilities", taskID, xssCount)
 }
 
-// collectSubdomains uses subfinder to collect subdomains
+// collectSubdomains uses subfinder to collect subdomains.
 func (s *Scanner) collectSubdomains(domain string, taskDir string) ([]string, error) {
-	outputFile := filepath.Join(taskDir, "subdomains.txt")
+	taskDirAbs, err := filepath.Abs(taskDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve task dir: %w", err)
+	}
+	outputFile := filepath.Join(taskDirAbs, "subdomains.txt")
 
-	// Try subfinder first
 	subfinderPath := filepath.Join(s.toolsDir, "subfinder")
 	if _, err := os.Stat(subfinderPath); os.IsNotExist(err) {
-		subfinderPath = "subfinder" // Try system PATH
+		subfinderPath = "subfinder"
+	} else if absPath, err := filepath.Abs(subfinderPath); err == nil {
+		subfinderPath = absPath
 	}
 
 	cmd := exec.Command(subfinderPath, "-d", domain, "-silent", "-o", outputFile)
-	cmd.Dir = taskDir
+	cmd.Dir = taskDirAbs
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		log.Printf("[Subfinder] Error: %v, Output: %s", err, string(output))
-		// If subfinder fails, create a file with just the root domain
 		os.WriteFile(outputFile, []byte(domain+"\n"), 0644)
 	}
 
 	return readLines(outputFile)
 }
 
-// probeAlive uses httpx to probe alive hosts
+// probeAlive uses httpx to probe alive hosts.
 func (s *Scanner) probeAlive(subdomains []string, taskDir string) ([]string, error) {
-	inputFile := filepath.Join(taskDir, "subdomains_all.txt")
-	outputFile := filepath.Join(taskDir, "alive.txt")
+	taskDirAbs, err := filepath.Abs(taskDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve task dir: %w", err)
+	}
+	inputFile := filepath.Join(taskDirAbs, "subdomains_all.txt")
+	outputFile := filepath.Join(taskDirAbs, "alive.txt")
 
-	// Write subdomains to input file
 	var content strings.Builder
 	for _, sub := range subdomains {
 		content.WriteString(sub + "\n")
@@ -364,18 +394,18 @@ func (s *Scanner) probeAlive(subdomains []string, taskDir string) ([]string, err
 		return nil, fmt.Errorf("failed to write input file: %w", err)
 	}
 
-	// Try httpx
 	httpxPath := filepath.Join(s.toolsDir, "httpx")
 	if _, err := os.Stat(httpxPath); os.IsNotExist(err) {
-		httpxPath = "httpx" // Try system PATH
+		httpxPath = "httpx"
+	} else if absPath, err := filepath.Abs(httpxPath); err == nil {
+		httpxPath = absPath
 	}
 
 	cmd := exec.Command(httpxPath, "-l", inputFile, "-silent", "-o", outputFile, "-no-color")
-	cmd.Dir = taskDir
+	cmd.Dir = taskDirAbs
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		log.Printf("[Httpx] Error: %v, Output: %s", err, string(output))
-		// If httpx fails, prefix subdomains with https://
 		var urls []string
 		for _, sub := range subdomains {
 			if !strings.HasPrefix(sub, "http") {
@@ -391,34 +421,33 @@ func (s *Scanner) probeAlive(subdomains []string, taskDir string) ([]string, err
 	return readLines(outputFile)
 }
 
-// runXscan runs xscan spider on each alive URL
+// runXscan runs xscan spider in batch mode using -f.
 func (s *Scanner) runXscan(taskID string, urls []string, taskDir string) (int, error) {
-	xssOutputDir := filepath.Join(taskDir, "xscan_output")
+	taskDirAbs, err := filepath.Abs(taskDir)
+	if err != nil {
+		return 0, fmt.Errorf("failed to resolve task dir: %w", err)
+	}
+
+	xssOutputDir := filepath.Join(taskDirAbs, "xscan_output")
 	os.MkdirAll(xssOutputDir, 0755)
 
-	totalXss := 0
 	if len(urls) == 0 {
 		return 0, nil
 	}
 
-	// 先将存活URL写入文件，再通过 spider -f 批量扫描（当前不做分组）。
-	targetsFile := filepath.Join(taskDir, "xscan_targets.txt")
+	targetsFile := filepath.Join(taskDirAbs, "xscan_targets.txt")
 	if err := os.WriteFile(targetsFile, []byte(strings.Join(urls, "\n")), 0644); err != nil {
 		return 0, fmt.Errorf("failed to write xscan targets file: %w", err)
 	}
 
 	log.Printf("[Task %s] Scanning %d URLs by file: %s", taskID, len(urls), targetsFile)
-	s.updateTaskStatus(taskID, models.StatusScanning,
-		fmt.Sprintf("正在批量扫描，共 %d 个URL", len(urls)))
-
-	cmd := exec.Command(s.xscanPath, "spider", "-f", targetsFile, "--output-dir", xssOutputDir)
+	cmd := exec.Command(s.xscanPath, "--output-dir", xssOutputDir, "spider", "-f", targetsFile)
 	cmd.Dir = filepath.Dir(s.xscanPath)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		// 与文档命令保持兼容：若版本不支持 -f，回退到 -file。
 		if strings.Contains(string(output), "flag provided but not defined: -f") {
 			log.Printf("[Task %s] -f not supported, fallback to -file", taskID)
-			cmd = exec.Command(s.xscanPath, "spider", "-file", targetsFile, "--output-dir", xssOutputDir)
+			cmd = exec.Command(s.xscanPath, "--output-dir", xssOutputDir, "spider", "-file", targetsFile)
 			cmd.Dir = filepath.Dir(s.xscanPath)
 			output, err = cmd.CombinedOutput()
 		}
@@ -427,8 +456,41 @@ func (s *Scanner) runXscan(taskID string, urls []string, taskDir string) (int, e
 		}
 	}
 
-	// Parse XSS results from output directory
-	matches, _ := filepath.Glob(filepath.Join(xssOutputDir, "*_xss.md"))
+	return s.parseAndStoreXSSReports(taskID, xssOutputDir, taskDirAbs)
+}
+
+// runXscanSingleURL runs xscan spider directly on one URL using -u.
+func (s *Scanner) runXscanSingleURL(taskID, targetURL, taskDir string) (int, error) {
+	taskDirAbs, err := filepath.Abs(taskDir)
+	if err != nil {
+		return 0, fmt.Errorf("failed to resolve task dir: %w", err)
+	}
+
+	xssOutputDir := filepath.Join(taskDirAbs, "xscan_output")
+	os.MkdirAll(xssOutputDir, 0755)
+
+	log.Printf("[Task %s] Scanning single URL by -u: %s", taskID, targetURL)
+	cmd := exec.Command(s.xscanPath, "--output-dir", xssOutputDir, "spider", "-u", targetURL)
+	cmd.Dir = filepath.Dir(s.xscanPath)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		if strings.Contains(string(output), "flag provided but not defined: -u") {
+			log.Printf("[Task %s] -u not supported, fallback to file mode", taskID)
+			return s.runXscan(taskID, []string{targetURL}, taskDirAbs)
+		}
+		return 0, fmt.Errorf("xscan spider url scan failed: %w, output: %s", err, string(output))
+	}
+
+	return s.parseAndStoreXSSReports(taskID, xssOutputDir, taskDirAbs)
+}
+
+func (s *Scanner) parseAndStoreXSSReports(taskID, xssOutputDir, taskDir string) (int, error) {
+	totalXSS := 0
+	matches, err := filepath.Glob(filepath.Join(xssOutputDir, "*_xss.md"))
+	if err != nil {
+		return 0, err
+	}
+
 	for _, match := range matches {
 		content, err := os.ReadFile(match)
 		if err != nil {
@@ -439,23 +501,18 @@ func (s *Scanner) runXscan(taskID string, urls []string, taskDir string) (int, e
 			continue
 		}
 
-		// Save to database
 		database.DB.Exec(
 			`INSERT INTO xss_results (task_id, url, report_content) VALUES (?, ?, ?)`,
 			taskID, match, reportContent,
 		)
-		totalXss++
-	}
+		totalXSS++
 
-	// Also copy xss.md files to task directory for easy access
-	for _, match := range matches {
 		destName := filepath.Base(match)
 		destPath := filepath.Join(taskDir, destName)
-		content, _ := os.ReadFile(match)
 		os.WriteFile(destPath, content, 0644)
 	}
 
-	return totalXss, nil
+	return totalXSS, nil
 }
 
 func (s *Scanner) updateTaskStatus(taskID, status, step string) {
@@ -472,13 +529,29 @@ func (s *Scanner) updateTaskCount(taskID, field string, count int) {
 	)
 }
 
+func (s *Scanner) completeTask(taskID string) {
+	now := time.Now()
+	database.DB.Exec(
+		`UPDATE tasks SET status = ?, current_step = ?, updated_at = ?, finished_at = ? WHERE id = ?`,
+		models.StatusCompleted, "completed", now, now, taskID,
+	)
+}
+
 func (s *Scanner) failTask(taskID, errMsg string) {
 	log.Printf("[Task %s] Failed: %s", taskID, errMsg)
 	now := time.Now()
 	database.DB.Exec(
 		`UPDATE tasks SET status = ?, current_step = ?, error_message = ?, updated_at = ?, finished_at = ? WHERE id = ?`,
-		models.StatusFailed, "执行失败", errMsg, now, now, taskID,
+		models.StatusFailed, "failed", errMsg, now, now, taskID,
 	)
+}
+
+func isValidHTTPURL(raw string) bool {
+	parsed, err := url.ParseRequestURI(raw)
+	if err != nil || parsed.Host == "" {
+		return false
+	}
+	return parsed.Scheme == "http" || parsed.Scheme == "https"
 }
 
 func readLines(filename string) ([]string, error) {

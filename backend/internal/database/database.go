@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -35,7 +36,9 @@ func createTables() {
 	schema := `
 	CREATE TABLE IF NOT EXISTS tasks (
 		id TEXT PRIMARY KEY,
+		scan_mode TEXT NOT NULL DEFAULT 'domain',
 		root_domain TEXT NOT NULL,
+		target_url TEXT DEFAULT '',
 		status TEXT NOT NULL DEFAULT 'pending',
 		subdomain_count INTEGER DEFAULT 0,
 		alive_count INTEGER DEFAULT 0,
@@ -81,6 +84,20 @@ func createTables() {
 	_, err := DB.Exec(schema)
 	if err != nil {
 		log.Fatalf("Failed to create tables: %v", err)
+	}
+
+	ensureTaskColumns()
+}
+
+func ensureTaskColumns() {
+	_, err := DB.Exec("ALTER TABLE tasks ADD COLUMN scan_mode TEXT NOT NULL DEFAULT 'domain'")
+	if err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		log.Fatalf("Failed to add tasks.scan_mode: %v", err)
+	}
+
+	_, err = DB.Exec("ALTER TABLE tasks ADD COLUMN target_url TEXT DEFAULT ''")
+	if err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		log.Fatalf("Failed to add tasks.target_url: %v", err)
 	}
 }
 

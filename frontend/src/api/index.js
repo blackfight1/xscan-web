@@ -38,8 +38,8 @@ api.interceptors.response.use(
 )
 
 // Tasks API
-export function createTask(rootDomain) {
-    return api.post('/tasks', { root_domain: rootDomain })
+export function createTask(payload) {
+    return api.post('/tasks', payload)
 }
 
 export function getTasks() {

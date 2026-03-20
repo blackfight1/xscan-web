@@ -2,6 +2,8 @@ package handler
 
 import (
 	"net/http"
+	"net/url"
+	"strings"
 
 	"xscan-web/internal/models"
 	"xscan-web/internal/scanner"
@@ -21,11 +23,44 @@ func New(s *scanner.Scanner) *Handler {
 func (h *Handler) CreateTask(c *gin.Context) {
 	var req models.CreateTaskRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "root_domain is required"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
 		return
 	}
 
-	task, err := h.scanner.CreateTask(req.RootDomain)
+	mode := strings.ToLower(strings.TrimSpace(req.Mode))
+	if mode == "" {
+		mode = models.ScanModeDomain
+	}
+
+	rootDomain := strings.TrimSpace(req.RootDomain)
+	targetURL := strings.TrimSpace(req.TargetURL)
+
+	switch mode {
+	case models.ScanModeDomain:
+		if rootDomain == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "root_domain is required for domain mode"})
+			return
+		}
+	case models.ScanModeURL:
+		if targetURL == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "target_url is required for url mode"})
+			return
+		}
+		parsed, err := url.ParseRequestURI(targetURL)
+		if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "target_url must be a valid http(s) URL"})
+			return
+		}
+		if parsed.Scheme != "http" && parsed.Scheme != "https" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "target_url must start with http:// or https://"})
+			return
+		}
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{"error": "mode must be domain or url"})
+		return
+	}
+
+	task, err := h.scanner.CreateTask(mode, rootDomain, targetURL)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return

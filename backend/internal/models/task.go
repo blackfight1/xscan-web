@@ -4,6 +4,11 @@ import "time"
 
 // Task status constants
 const (
+	ScanModeDomain = "domain"
+	ScanModeURL    = "url"
+)
+
+const (
 	StatusPending   = "pending"
 	StatusSubdomain = "subdomain_collecting"
 	StatusHttpx     = "httpx_probing"
@@ -15,7 +20,9 @@ const (
 
 type Task struct {
 	ID             string     `json:"id"`
+	ScanMode       string     `json:"scan_mode"`
 	RootDomain     string     `json:"root_domain"`
+	TargetURL      string     `json:"target_url"`
 	Status         string     `json:"status"`
 	SubdomainCount int        `json:"subdomain_count"`
 	AliveCount     int        `json:"alive_count"`
@@ -56,7 +63,9 @@ type XssResult struct {
 
 // API request/response types
 type CreateTaskRequest struct {
-	RootDomain string `json:"root_domain" binding:"required"`
+	Mode       string `json:"mode"`
+	RootDomain string `json:"root_domain"`
+	TargetURL  string `json:"target_url"`
 }
 
 type TaskListResponse struct {
