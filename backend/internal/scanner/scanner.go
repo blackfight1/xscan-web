@@ -373,8 +373,18 @@ func (s *Scanner) executeTask(ctx context.Context, taskID string) {
 		return
 	}
 
+	rawDomains := strings.TrimSpace(task.TargetURL)
+	if rawDomains == "" {
+		rawDomains = strings.TrimSpace(task.RootDomain)
+	}
+	rootDomains := splitUniqueLines(rawDomains)
+	if len(rootDomains) == 0 {
+		s.failTask(taskID, "no valid root domains found")
+		return
+	}
+
 	s.updateTaskStatus(taskID, models.StatusSubdomain, "collecting subdomains")
-	subdomains, err := s.collectSubdomains(ctx, taskID, task.RootDomain, taskDir)
+	subdomains, err := s.collectSubdomains(ctx, taskID, rootDomains, taskDir)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			s.cancelTask(taskID, "task cancelled")
@@ -391,7 +401,7 @@ func (s *Scanner) executeTask(ctx context.Context, taskID string) {
 	log.Printf("[Task %s] Found %d subdomains", taskID, len(subdomains))
 
 	if len(subdomains) == 0 {
-		subdomains = []string{task.RootDomain}
+		subdomains = rootDomains
 	}
 
 	s.updateTaskStatus(taskID, models.StatusHttpx, "probing alive hosts")
@@ -438,12 +448,15 @@ func (s *Scanner) executeTask(ctx context.Context, taskID string) {
 }
 
 // collectSubdomains uses subfinder to collect subdomains.
-func (s *Scanner) collectSubdomains(ctx context.Context, taskID, domain string, taskDir string) ([]string, error) {
+func (s *Scanner) collectSubdomains(ctx context.Context, taskID string, domains []string, taskDir string) ([]string, error) {
 	taskDirAbs, err := filepath.Abs(taskDir)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve task dir: %w", err)
 	}
-	outputFile := filepath.Join(taskDirAbs, "subdomains.txt")
+	domains = splitUniqueLines(strings.Join(domains, "\n"))
+	if len(domains) == 0 {
+		return nil, nil
+	}
 
 	subfinderPath := filepath.Join(s.toolsDir, "subfinder")
 	if _, err := os.Stat(subfinderPath); os.IsNotExist(err) {
@@ -452,18 +465,52 @@ func (s *Scanner) collectSubdomains(ctx context.Context, taskID, domain string, 
 		subfinderPath = absPath
 	}
 
-	cmd := exec.CommandContext(ctx, subfinderPath, "-d", domain, "-silent", "-all", "-o", outputFile)
+	if len(domains) == 1 {
+		outputFile := filepath.Join(taskDirAbs, "subdomains.txt")
+		cmd := exec.CommandContext(ctx, subfinderPath, "-d", domains[0], "-silent", "-all", "-o", outputFile)
+		cmd.Dir = taskDirAbs
+		output, err := s.runCommand(taskID, cmd)
+		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return nil, context.Canceled
+			}
+			log.Printf("[Subfinder] Error: %v, Output: %s", err, string(output))
+			if writeErr := os.WriteFile(outputFile, []byte(domains[0]+"\n"), 0644); writeErr != nil {
+				return nil, writeErr
+			}
+		}
+		return readLines(outputFile)
+	}
+
+	inputFile := filepath.Join(taskDirAbs, "root_domains.txt")
+	outputDir := filepath.Join(taskDirAbs, "subfinder_output")
+	if err := os.WriteFile(inputFile, []byte(strings.Join(domains, "\n")), 0644); err != nil {
+		return nil, fmt.Errorf("failed to write subfinder input file: %w", err)
+	}
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create subfinder output dir: %w", err)
+	}
+
+	cmd := exec.CommandContext(ctx, subfinderPath, "-dL", inputFile, "-silent", "-all", "-oD", outputDir)
 	cmd.Dir = taskDirAbs
 	output, err := s.runCommand(taskID, cmd)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			return nil, context.Canceled
 		}
-		log.Printf("[Subfinder] Error: %v, Output: %s", err, string(output))
-		os.WriteFile(outputFile, []byte(domain+"\n"), 0644)
+		log.Printf("[Subfinder] Batch error: %v, Output: %s", err, string(output))
+		return domains, nil
 	}
 
-	return readLines(outputFile)
+	subdomains, err := readLinesFromDir(outputDir)
+	if err != nil {
+		return nil, err
+	}
+	if len(subdomains) == 0 {
+		return domains, nil
+	}
+
+	return subdomains, nil
 }
 
 // probeAlive uses httpx to probe alive hosts.
@@ -771,4 +818,45 @@ func readLines(filename string) ([]string, error) {
 		}
 	}
 	return lines, scanner.Err()
+}
+
+func readLinesFromDir(dir string) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	var all []string
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+
+		lines, err := readLines(filepath.Join(dir, entry.Name()))
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, lines...)
+	}
+
+	return splitUniqueLines(strings.Join(all, "\n")), nil
+}
+
+func splitUniqueLines(raw string) []string {
+	var lines []string
+	seen := make(map[string]struct{})
+
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if _, ok := seen[line]; ok {
+			continue
+		}
+		seen[line] = struct{}{}
+		lines = append(lines, line)
+	}
+
+	return lines
 }

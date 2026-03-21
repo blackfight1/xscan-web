@@ -61,25 +61,30 @@ func (h *Handler) CreateTask(c *gin.Context) {
 
 	switch mode {
 	case models.ScanModeDomain:
-		// Domain mode: each domain creates a separate task
-		var createdTasks []*models.Task
+		var validDomains []string
 		for _, domain := range targets {
 			domain = strings.TrimSpace(domain)
-			if domain == "" {
-				continue
+			if domain != "" {
+				validDomains = append(validDomains, domain)
 			}
-			task, err := h.scanner.CreateTask(mode, domain, "")
-			if err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to create task for %s: %v", domain, err)})
-				return
-			}
-			createdTasks = append(createdTasks, task)
 		}
-		if len(createdTasks) == 1 {
-			c.JSON(http.StatusCreated, gin.H{"message": "Task created", "task": createdTasks[0]})
-		} else {
-			c.JSON(http.StatusCreated, gin.H{"message": fmt.Sprintf("%d tasks created", len(createdTasks)), "tasks": createdTasks})
+		if len(validDomains) == 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "no valid domains provided"})
+			return
 		}
+
+		displayTarget := validDomains[0]
+		if len(validDomains) > 1 {
+			displayTarget = fmt.Sprintf("%s (+%d more)", validDomains[0], len(validDomains)-1)
+		}
+		domainsJoined := strings.Join(validDomains, "\n")
+
+		task, err := h.scanner.CreateTask(mode, displayTarget, domainsJoined)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusCreated, gin.H{"message": "Task created", "task": task})
 
 	case models.ScanModeURL:
 		// URL mode: validate all URLs first
