@@ -1,6 +1,5 @@
-<template>
+﻿<template>
   <div class="task-list">
-    <!-- Create Task Area -->
     <div class="create-section">
       <div class="create-glow"></div>
       <div class="create-inner">
@@ -8,6 +7,7 @@
           <h2>New Scan</h2>
           <p>Enter targets to start XSS vulnerability scanning</p>
         </div>
+
         <div class="create-form">
           <div class="mode-switch">
             <button :class="['mode-btn', { active: scanMode === 'domain' }]" @click="scanMode = 'domain'">
@@ -19,16 +19,18 @@
               URL Mode
             </button>
           </div>
+
           <div class="mode-desc">
             <template v-if="scanMode === 'domain'">
-              <span class="desc-icon">🔍</span>
-              <span>Subfinder → Httpx → XScan full pipeline. Enter one domain per line. Each domain creates a separate task.</span>
+              <span class="desc-icon">D</span>
+              <span>Subfinder -> Httpx -> XScan full pipeline. Enter one domain per line. Each domain creates a separate task.</span>
             </template>
             <template v-else>
-              <span class="desc-icon">⚡</span>
-              <span>Direct XSS scan, skip subdomain &amp; probing. Enter one URL per line (must start with http/https). All URLs go into one task. Single URL uses <code>xscan spider -u</code>, multiple uses <code>xscan spider -f</code>.</span>
+              <span class="desc-icon">U</span>
+              <span>Direct XSS scan. Enter one URL per line (http/https). Single URL uses <code>xscan spider -u</code>, multiple URLs use <code>xscan spider -f</code>.</span>
             </template>
           </div>
+
           <div class="input-area">
             <textarea
               v-model="targetInput"
@@ -38,7 +40,7 @@
               @keydown.ctrl.enter="handleCreate"
             ></textarea>
             <div class="input-footer">
-              <span class="input-hint">{{ targetCount }} target{{ targetCount !== 1 ? 's' : '' }} · Ctrl+Enter to submit</span>
+              <span class="input-hint">{{ targetCount }} target{{ targetCount !== 1 ? 's' : '' }} | Ctrl+Enter to submit</span>
               <el-button type="primary" size="large" :loading="creating" @click="handleCreate" class="scan-btn">
                 <el-icon><VideoPlay /></el-icon>
                 Start Scan
@@ -49,7 +51,6 @@
       </div>
     </div>
 
-    <!-- Stats -->
     <div class="stats-row">
       <div class="stat-card">
         <div class="stat-icon total">
@@ -89,7 +90,6 @@
       </div>
     </div>
 
-    <!-- Task Table -->
     <el-card shadow="never" class="table-card">
       <template #header>
         <div class="card-header">
@@ -101,8 +101,8 @@
         </div>
       </template>
 
-      <el-table :data="tasks" v-loading="loading" empty-text="No tasks yet" stripe>
-        <el-table-column prop="id" label="ID" width="80" />
+      <el-table :data="displayTasks" v-loading="loading" empty-text="No tasks yet" stripe>
+        <el-table-column prop="id" label="ID" width="92" />
 
         <el-table-column label="Mode" width="110" align="center">
           <template #default="{ row }">
@@ -112,13 +112,19 @@
           </template>
         </el-table-column>
 
-        <el-table-column prop="root_domain" label="Target" min-width="240">
+        <el-table-column prop="root_domain" label="Target" min-width="290">
           <template #default="{ row }">
-            <span class="target-text">{{ row.root_domain }}</span>
+            <div class="target-cell">
+              <div class="target-head">
+                <span class="target-main">{{ targetMain(row.root_domain) }}</span>
+                <span v-if="targetExtraCount(row.root_domain) > 0" class="target-extra">+{{ targetExtraCount(row.root_domain) }}</span>
+              </div>
+              <div class="target-sub">{{ targetPreview(row.root_domain) }}</div>
+            </div>
           </template>
         </el-table-column>
 
-        <el-table-column label="Status" width="170">
+        <el-table-column label="Status" width="160">
           <template #default="{ row }">
             <span :class="['status-badge', `status-${statusClass(row.status)}`]">
               <span class="status-dot"></span>
@@ -127,18 +133,23 @@
           </template>
         </el-table-column>
 
-        <el-table-column label="Progress" min-width="200">
+        <el-table-column label="Progress" min-width="230">
           <template #default="{ row }">
-            <span class="step-text">{{ row.current_step || '-' }}</span>
+            <div class="progress-cell">
+              <span class="step-text">{{ row.current_step || '-' }}</span>
+              <div class="progress-track">
+                <div class="progress-fill" :style="{ width: `${progressPercent(row)}%` }"></div>
+              </div>
+            </div>
           </template>
         </el-table-column>
 
         <el-table-column prop="subdomain_count" label="Sub" width="70" align="center" />
         <el-table-column prop="alive_count" label="Alive" width="70" align="center" />
 
-        <el-table-column label="XSS" width="70" align="center">
+        <el-table-column label="XSS" width="74" align="center">
           <template #default="{ row }">
-            <span v-if="row.xss_count > 0" class="xss-badge">{{ row.xss_count }}</span>
+            <span v-if="row.xss_count > 0" class="xss-badge hot">{{ row.xss_count }}</span>
             <span v-else class="text-muted">0</span>
           </template>
         </el-table-column>
@@ -190,23 +201,79 @@ const inputPlaceholder = computed(() =>
     : 'example.com\nexample.org\ntest.com'
 )
 
-const targetCount = computed(() => {
-  return targetInput.value.split('\n').filter(l => l.trim()).length
-})
+const targetCount = computed(() => targetInput.value.split('\n').filter((line) => line.trim()).length)
 
 const runningCount = computed(() =>
-  tasks.value.filter(t =>
-    ['pending', 'subdomain_collecting', 'httpx_probing', 'xss_scanning'].includes(t.status)
-  ).length
+  tasks.value.filter((item) => ['pending', 'subdomain_collecting', 'httpx_probing', 'xss_scanning'].includes(item.status)).length
 )
 
-const completedCount = computed(() =>
-  tasks.value.filter(t => t.status === 'completed').length
-)
+const completedCount = computed(() => tasks.value.filter((item) => item.status === 'completed').length)
 
-const totalXss = computed(() =>
-  tasks.value.reduce((sum, t) => sum + (t.xss_count || 0), 0)
-)
+const totalXss = computed(() => tasks.value.reduce((sum, item) => sum + (item.xss_count || 0), 0))
+
+const displayTasks = computed(() => {
+  const score = {
+    xss_scanning: 4,
+    httpx_probing: 3,
+    subdomain_collecting: 2,
+    pending: 1,
+    failed: 0,
+    completed: 0,
+    cancelled: 0,
+  }
+
+  return [...tasks.value].sort((a, b) => {
+    const sa = score[a.status] || 0
+    const sb = score[b.status] || 0
+    if (sa !== sb) return sb - sa
+    return new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+  })
+})
+
+function splitTargets(raw) {
+  return String(raw || '')
+    .split('\n')
+    .map((item) => item.trim())
+    .filter(Boolean)
+}
+
+function targetMain(raw) {
+  const list = splitTargets(raw)
+  return list[0] || '-'
+}
+
+function targetExtraCount(raw) {
+  const list = splitTargets(raw)
+  return Math.max(0, list.length - 1)
+}
+
+function targetPreview(raw) {
+  const list = splitTargets(raw)
+  if (!list.length) return '-'
+  if (list.length === 1) return list[0]
+  return `${list[0]} + ${list.length - 1} more`
+}
+
+function progressPercent(row) {
+  if (row.status === 'failed' || row.status === 'cancelled') return 100
+  if (row.status === 'completed') return 100
+
+  if (row.scan_mode === 'url') {
+    const map = {
+      pending: 12,
+      xss_scanning: 68,
+    }
+    return map[row.status] || 8
+  }
+
+  const map = {
+    pending: 8,
+    subdomain_collecting: 30,
+    httpx_probing: 60,
+    xss_scanning: 85,
+  }
+  return map[row.status] || 8
+}
 
 async function loadTasks() {
   loading.value = true
@@ -221,13 +288,16 @@ async function loadTasks() {
 }
 
 async function handleCreate() {
-  const lines = targetInput.value.split('\n').map(l => l.trim()).filter(l => l)
-  if (lines.length === 0) {
+  const lines = targetInput.value
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+
+  if (!lines.length) {
     ElMessage.warning(scanMode.value === 'url' ? 'Enter at least one URL' : 'Enter at least one domain')
     return
   }
 
-  // Validate URLs in url mode
   if (scanMode.value === 'url') {
     for (const line of lines) {
       if (!/^https?:\/\//i.test(line)) {
@@ -239,7 +309,7 @@ async function handleCreate() {
 
   const payload = {
     mode: scanMode.value,
-    targets: lines
+    targets: lines,
   }
 
   creating.value = true
@@ -253,7 +323,7 @@ async function handleCreate() {
     targetInput.value = ''
     await loadTasks()
   } catch (err) {
-    ElMessage.error('Failed: ' + (err.response?.data?.error || err.message))
+    ElMessage.error(`Failed: ${err.response?.data?.error || err.message}`)
   } finally {
     creating.value = false
   }
@@ -301,7 +371,13 @@ function statusText(status) {
 
 function formatTime(time) {
   if (!time) return '-'
-  return new Date(time).toLocaleString('en-US', { hour12: false, month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+  return new Date(time).toLocaleString('en-US', {
+    hour12: false,
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  })
 }
 
 onMounted(() => {
@@ -321,7 +397,6 @@ onUnmounted(() => {
   gap: 24px;
 }
 
-/* Create Section */
 .create-section {
   position: relative;
   border-radius: 16px;
@@ -407,7 +482,16 @@ onUnmounted(() => {
 
 .mode-desc .desc-icon {
   flex-shrink: 0;
-  font-size: 16px;
+  width: 18px;
+  height: 18px;
+  border-radius: 5px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 700;
+  color: #7dd3fc;
+  background: rgba(0, 212, 255, 0.14);
 }
 
 .mode-desc code {
@@ -469,7 +553,6 @@ onUnmounted(() => {
   border: none !important;
 }
 
-/* Stats */
 .stats-row {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
@@ -521,7 +604,6 @@ onUnmounted(() => {
   letter-spacing: 0.5px;
 }
 
-/* Table card */
 .table-card { overflow: hidden; }
 
 .card-header {
@@ -539,7 +621,6 @@ onUnmounted(() => {
 .refresh-btn { color: var(--text-muted) !important; }
 .refresh-btn:hover { color: var(--accent) !important; }
 
-/* Mode badge */
 .mode-badge {
   display: inline-block;
   padding: 3px 10px;
@@ -553,13 +634,46 @@ onUnmounted(() => {
 .mode-domain { background: rgba(99, 102, 241, 0.15); color: #818cf8; }
 .mode-url { background: rgba(16, 185, 129, 0.15); color: #34d399; }
 
-.target-text {
-  color: var(--text-primary);
-  font-weight: 500;
-  word-break: break-all;
+.target-cell {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
 }
 
-/* Status badge */
+.target-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.target-main {
+  color: var(--text-primary);
+  font-weight: 600;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.target-extra {
+  font-size: 11px;
+  font-weight: 700;
+  color: #7dd3fc;
+  background: rgba(0, 212, 255, 0.1);
+  border: 1px solid rgba(0, 212, 255, 0.3);
+  border-radius: 999px;
+  padding: 1px 7px;
+}
+
+.target-sub {
+  font-size: 12px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .status-badge {
   display: inline-flex;
   align-items: center;
@@ -571,20 +685,50 @@ onUnmounted(() => {
 }
 
 .status-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
-.status-pending { background: rgba(100,116,139,.15); color: #94a3b8; }
+.status-pending { background: rgba(100, 116, 139, 0.15); color: #94a3b8; }
 .status-pending .status-dot { background: #94a3b8; }
-.status-running { background: rgba(245,158,11,.15); color: #fbbf24; }
+.status-running { background: rgba(245, 158, 11, 0.15); color: #fbbf24; }
 .status-running .status-dot { background: #fbbf24; animation: pulse 1.5s infinite; }
-.status-completed { background: rgba(16,185,129,.15); color: #34d399; }
+.status-completed { background: rgba(16, 185, 129, 0.15); color: #34d399; }
 .status-completed .status-dot { background: #34d399; }
-.status-failed { background: rgba(239,68,68,.15); color: #f87171; }
+.status-failed { background: rgba(239, 68, 68, 0.15); color: #f87171; }
 .status-failed .status-dot { background: #f87171; }
-.status-cancelled { background: rgba(100,116,139,.15); color: #64748b; }
+.status-cancelled { background: rgba(100, 116, 139, 0.15); color: #64748b; }
 .status-cancelled .status-dot { background: #64748b; }
 
-@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: .4; }
+}
 
-.step-text { font-size: 13px; color: var(--text-secondary); }
+.progress-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.step-text {
+  font-size: 13px;
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.progress-track {
+  width: 100%;
+  height: 6px;
+  background: rgba(148, 163, 184, 0.16);
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #06b6d4, #38bdf8);
+  transition: width .35s ease;
+}
 
 .xss-badge {
   display: inline-flex;
@@ -594,16 +738,18 @@ onUnmounted(() => {
   height: 22px;
   padding: 0 6px;
   border-radius: 6px;
-  background: rgba(239,68,68,.2);
-  color: #f87171;
   font-size: 12px;
   font-weight: 700;
+}
+
+.xss-badge.hot {
+  background: rgba(239, 68, 68, 0.2);
+  color: #f87171;
 }
 
 .text-muted { color: var(--text-muted); }
 .time-text { font-size: 13px; color: var(--text-muted); }
 
-/* Action buttons */
 .action-btns { display: flex; gap: 6px; }
 
 .action-btn {
@@ -623,7 +769,7 @@ onUnmounted(() => {
 .action-btn.view { color: var(--accent); }
 .action-btn.view:hover { background: var(--accent-glow); border-color: var(--accent); }
 .action-btn.delete { color: var(--text-muted); }
-.action-btn.delete:hover { color: #f87171; background: rgba(239,68,68,.1); border-color: rgba(239,68,68,.3); }
+.action-btn.delete:hover { color: #f87171; background: rgba(239, 68, 68, 0.1); border-color: rgba(239, 68, 68, 0.3); }
 
 @media (max-width: 768px) {
   .stats-row { grid-template-columns: repeat(2, 1fr); }
@@ -631,3 +777,5 @@ onUnmounted(() => {
   .scan-btn { min-width: auto; width: 100%; }
 }
 </style>
+
+
