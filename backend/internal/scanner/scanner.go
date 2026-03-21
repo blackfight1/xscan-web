@@ -466,15 +466,20 @@ func (s *Scanner) runXscan(taskID string, urls []string, taskDir string) (int, e
 		return 0, fmt.Errorf("failed to write xscan targets file: %w", err)
 	}
 
+	xscanPathAbs, xscanDir, err := s.resolveXscanExec()
+	if err != nil {
+		return 0, err
+	}
+
 	log.Printf("[Task %s] Scanning %d URLs by file: %s", taskID, len(urls), targetsFile)
-	cmd := exec.Command(s.xscanPath, "--output-dir", xssOutputDir, "spider", "-f", targetsFile)
-	cmd.Dir = filepath.Dir(s.xscanPath)
+	cmd := exec.Command(xscanPathAbs, "--output-dir", xssOutputDir, "spider", "-f", targetsFile)
+	cmd.Dir = xscanDir
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		if strings.Contains(string(output), "flag provided but not defined: -f") {
 			log.Printf("[Task %s] -f not supported, fallback to -file", taskID)
-			cmd = exec.Command(s.xscanPath, "--output-dir", xssOutputDir, "spider", "-file", targetsFile)
-			cmd.Dir = filepath.Dir(s.xscanPath)
+			cmd = exec.Command(xscanPathAbs, "--output-dir", xssOutputDir, "spider", "-file", targetsFile)
+			cmd.Dir = xscanDir
 			output, err = cmd.CombinedOutput()
 		}
 		if err != nil {
@@ -495,9 +500,14 @@ func (s *Scanner) runXscanSingleURL(taskID, targetURL, taskDir string) (int, err
 	xssOutputDir := filepath.Join(taskDirAbs, "xscan_output")
 	os.MkdirAll(xssOutputDir, 0755)
 
+	xscanPathAbs, xscanDir, err := s.resolveXscanExec()
+	if err != nil {
+		return 0, err
+	}
+
 	log.Printf("[Task %s] Scanning single URL by -u: %s", taskID, targetURL)
-	cmd := exec.Command(s.xscanPath, "--output-dir", xssOutputDir, "spider", "-u", targetURL)
-	cmd.Dir = filepath.Dir(s.xscanPath)
+	cmd := exec.Command(xscanPathAbs, "--output-dir", xssOutputDir, "spider", "-u", targetURL)
+	cmd.Dir = xscanDir
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		if strings.Contains(string(output), "flag provided but not defined: -u") {
@@ -508,6 +518,28 @@ func (s *Scanner) runXscanSingleURL(taskID, targetURL, taskDir string) (int, err
 	}
 
 	return s.parseAndStoreXSSReports(taskID, xssOutputDir, taskDirAbs)
+}
+
+func (s *Scanner) resolveXscanExec() (string, string, error) {
+	xscanPath := strings.TrimSpace(s.xscanPath)
+	if xscanPath == "" {
+		return "", "", fmt.Errorf("xscan path is empty")
+	}
+
+	xscanPathAbs, err := filepath.Abs(xscanPath)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to resolve xscan path: %w", err)
+	}
+
+	info, err := os.Stat(xscanPathAbs)
+	if err != nil {
+		return "", "", fmt.Errorf("xscan binary not found at %s: %w", xscanPathAbs, err)
+	}
+	if info.IsDir() {
+		return "", "", fmt.Errorf("xscan path is a directory, expected executable file: %s", xscanPathAbs)
+	}
+
+	return xscanPathAbs, filepath.Dir(xscanPathAbs), nil
 }
 
 func (s *Scanner) parseAndStoreXSSReports(taskID, xssOutputDir, taskDir string) (int, error) {
