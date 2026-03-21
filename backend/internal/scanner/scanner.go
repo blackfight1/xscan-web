@@ -452,7 +452,7 @@ func (s *Scanner) collectSubdomains(ctx context.Context, taskID, domain string, 
 		subfinderPath = absPath
 	}
 
-	cmd := exec.CommandContext(ctx, subfinderPath, "-d", domain, "-silent", "-o", outputFile)
+	cmd := exec.CommandContext(ctx, subfinderPath, "-d", domain, "-silent", "-all", "-o", outputFile)
 	cmd.Dir = taskDirAbs
 	output, err := s.runCommand(taskID, cmd)
 	if err != nil {
