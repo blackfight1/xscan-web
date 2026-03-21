@@ -2,7 +2,9 @@ package scanner
 
 import (
 	"bufio"
+	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"net/url"
@@ -28,6 +30,7 @@ type Scanner struct {
 	mu            sync.Mutex
 	taskQueue     chan string
 	quit          chan struct{}
+	executions    map[string]*taskExecution
 }
 
 type Config struct {
@@ -35,6 +38,11 @@ type Config struct {
 	ToolsDir      string
 	ResultsDir    string
 	MaxConcurrent int
+}
+
+type taskExecution struct {
+	cancel context.CancelFunc
+	cmd    *exec.Cmd
 }
 
 func New(cfg Config) *Scanner {
@@ -52,6 +60,7 @@ func New(cfg Config) *Scanner {
 		maxConcurrent: cfg.MaxConcurrent,
 		taskQueue:     make(chan string, 100),
 		quit:          make(chan struct{}),
+		executions:    make(map[string]*taskExecution),
 	}
 
 	go s.worker()
@@ -64,12 +73,14 @@ func (s *Scanner) worker() {
 		case taskID := <-s.taskQueue:
 			s.mu.Lock()
 			s.running++
+			ctx := s.beginExecution(taskID)
 			s.mu.Unlock()
 
-			s.executeTask(taskID)
+			s.executeTask(ctx, taskID)
 
 			s.mu.Lock()
 			s.running--
+			s.endExecution(taskID)
 			s.mu.Unlock()
 		case <-s.quit:
 			return
@@ -78,6 +89,18 @@ func (s *Scanner) worker() {
 }
 
 func (s *Scanner) Stop() {
+	s.mu.Lock()
+	var cancels []context.CancelFunc
+	for _, e := range s.executions {
+		if e != nil && e.cancel != nil {
+			cancels = append(cancels, e.cancel)
+		}
+	}
+	s.mu.Unlock()
+
+	for _, cancel := range cancels {
+		cancel()
+	}
 	close(s.quit)
 }
 
@@ -225,6 +248,8 @@ func (s *Scanner) GetTaskDetail(id string) (*models.TaskDetailResponse, error) {
 
 // DeleteTask deletes a task and its results.
 func (s *Scanner) DeleteTask(id string) error {
+	s.cancelExecution(id)
+
 	database.DB.Exec("DELETE FROM xss_results WHERE task_id = ?", id)
 	database.DB.Exec("DELETE FROM alive_urls WHERE task_id = ?", id)
 	database.DB.Exec("DELETE FROM subdomains WHERE task_id = ?", id)
@@ -261,12 +286,17 @@ func (s *Scanner) GetReport(taskID string) (string, error) {
 }
 
 // executeTask runs either domain workflow or URL workflow.
-func (s *Scanner) executeTask(taskID string) {
+func (s *Scanner) executeTask(ctx context.Context, taskID string) {
 	log.Printf("[Task %s] Starting execution", taskID)
 
 	task, err := s.GetTask(taskID)
 	if err != nil {
 		log.Printf("[Task %s] Failed to get task: %v", taskID, err)
+		return
+	}
+
+	if errors.Is(ctx.Err(), context.Canceled) {
+		s.cancelTask(taskID, "task cancelled")
 		return
 	}
 
@@ -309,19 +339,32 @@ func (s *Scanner) executeTask(taskID string) {
 		if len(urlList) == 1 {
 			// Single URL: use xscan spider -u
 			s.updateTaskStatus(taskID, models.StatusScanning, fmt.Sprintf("running xscan spider -u (%s)", urlList[0]))
-			xssCount, err = s.runXscanSingleURL(taskID, urlList[0], taskDir)
+			xssCount, err = s.runXscanSingleURL(ctx, taskID, urlList[0], taskDir)
 			if err != nil {
+				if errors.Is(err, context.Canceled) {
+					s.cancelTask(taskID, "task cancelled")
+					return
+				}
 				s.failTask(taskID, fmt.Sprintf("xscan spider -u failed: %v", err))
 				return
 			}
 		} else {
 			// Multiple URLs: use xscan spider -f
 			s.updateTaskStatus(taskID, models.StatusScanning, fmt.Sprintf("running xscan spider -f (%d URLs)", len(urlList)))
-			xssCount, err = s.runXscan(taskID, urlList, taskDir)
+			xssCount, err = s.runXscan(ctx, taskID, urlList, taskDir)
 			if err != nil {
+				if errors.Is(err, context.Canceled) {
+					s.cancelTask(taskID, "task cancelled")
+					return
+				}
 				s.failTask(taskID, fmt.Sprintf("xscan spider -f failed: %v", err))
 				return
 			}
+		}
+
+		if errors.Is(ctx.Err(), context.Canceled) {
+			s.cancelTask(taskID, "task cancelled")
+			return
 		}
 
 		s.updateTaskCount(taskID, "xss_count", xssCount)
@@ -331,8 +374,12 @@ func (s *Scanner) executeTask(taskID string) {
 	}
 
 	s.updateTaskStatus(taskID, models.StatusSubdomain, "collecting subdomains")
-	subdomains, err := s.collectSubdomains(task.RootDomain, taskDir)
+	subdomains, err := s.collectSubdomains(ctx, taskID, task.RootDomain, taskDir)
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			s.cancelTask(taskID, "task cancelled")
+			return
+		}
 		s.failTask(taskID, fmt.Sprintf("subdomain collection failed: %v", err))
 		return
 	}
@@ -348,8 +395,12 @@ func (s *Scanner) executeTask(taskID string) {
 	}
 
 	s.updateTaskStatus(taskID, models.StatusHttpx, "probing alive hosts")
-	aliveURLs, err := s.probeAlive(subdomains, taskDir)
+	aliveURLs, err := s.probeAlive(ctx, taskID, subdomains, taskDir)
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			s.cancelTask(taskID, "task cancelled")
+			return
+		}
 		s.failTask(taskID, fmt.Sprintf("httpx probe failed: %v", err))
 		return
 	}
@@ -366,9 +417,18 @@ func (s *Scanner) executeTask(taskID string) {
 	}
 
 	s.updateTaskStatus(taskID, models.StatusScanning, "running xscan spider -f")
-	xssCount, err := s.runXscan(taskID, aliveURLs, taskDir)
+	xssCount, err := s.runXscan(ctx, taskID, aliveURLs, taskDir)
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			s.cancelTask(taskID, "task cancelled")
+			return
+		}
 		s.failTask(taskID, fmt.Sprintf("xscan spider -f failed: %v", err))
+		return
+	}
+
+	if errors.Is(ctx.Err(), context.Canceled) {
+		s.cancelTask(taskID, "task cancelled")
 		return
 	}
 
@@ -378,7 +438,7 @@ func (s *Scanner) executeTask(taskID string) {
 }
 
 // collectSubdomains uses subfinder to collect subdomains.
-func (s *Scanner) collectSubdomains(domain string, taskDir string) ([]string, error) {
+func (s *Scanner) collectSubdomains(ctx context.Context, taskID, domain string, taskDir string) ([]string, error) {
 	taskDirAbs, err := filepath.Abs(taskDir)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve task dir: %w", err)
@@ -392,10 +452,13 @@ func (s *Scanner) collectSubdomains(domain string, taskDir string) ([]string, er
 		subfinderPath = absPath
 	}
 
-	cmd := exec.Command(subfinderPath, "-d", domain, "-silent", "-o", outputFile)
+	cmd := exec.CommandContext(ctx, subfinderPath, "-d", domain, "-silent", "-o", outputFile)
 	cmd.Dir = taskDirAbs
-	output, err := cmd.CombinedOutput()
+	output, err := s.runCommand(taskID, cmd)
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return nil, context.Canceled
+		}
 		log.Printf("[Subfinder] Error: %v, Output: %s", err, string(output))
 		os.WriteFile(outputFile, []byte(domain+"\n"), 0644)
 	}
@@ -404,7 +467,7 @@ func (s *Scanner) collectSubdomains(domain string, taskDir string) ([]string, er
 }
 
 // probeAlive uses httpx to probe alive hosts.
-func (s *Scanner) probeAlive(subdomains []string, taskDir string) ([]string, error) {
+func (s *Scanner) probeAlive(ctx context.Context, taskID string, subdomains []string, taskDir string) ([]string, error) {
 	taskDirAbs, err := filepath.Abs(taskDir)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve task dir: %w", err)
@@ -427,10 +490,13 @@ func (s *Scanner) probeAlive(subdomains []string, taskDir string) ([]string, err
 		httpxPath = absPath
 	}
 
-	cmd := exec.Command(httpxPath, "-l", inputFile, "-silent", "-o", outputFile, "-no-color")
+	cmd := exec.CommandContext(ctx, httpxPath, "-l", inputFile, "-silent", "-o", outputFile, "-no-color")
 	cmd.Dir = taskDirAbs
-	output, err := cmd.CombinedOutput()
+	output, err := s.runCommand(taskID, cmd)
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return nil, context.Canceled
+		}
 		log.Printf("[Httpx] Error: %v, Output: %s", err, string(output))
 		var urls []string
 		for _, sub := range subdomains {
@@ -448,7 +514,7 @@ func (s *Scanner) probeAlive(subdomains []string, taskDir string) ([]string, err
 }
 
 // runXscan runs xscan spider in batch mode using -f.
-func (s *Scanner) runXscan(taskID string, urls []string, taskDir string) (int, error) {
+func (s *Scanner) runXscan(ctx context.Context, taskID string, urls []string, taskDir string) (int, error) {
 	taskDirAbs, err := filepath.Abs(taskDir)
 	if err != nil {
 		return 0, fmt.Errorf("failed to resolve task dir: %w", err)
@@ -472,26 +538,36 @@ func (s *Scanner) runXscan(taskID string, urls []string, taskDir string) (int, e
 	}
 
 	log.Printf("[Task %s] Scanning %d URLs by file: %s", taskID, len(urls), targetsFile)
-	cmd := exec.Command(xscanPathAbs, "--output-dir", xssOutputDir, "spider", "-f", targetsFile)
+	cmd := exec.CommandContext(ctx, xscanPathAbs, "--output-dir", xssOutputDir, "spider", "-f", targetsFile)
 	cmd.Dir = xscanDir
-	output, err := cmd.CombinedOutput()
+	output, err := s.runCommand(taskID, cmd)
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return 0, context.Canceled
+		}
 		if strings.Contains(string(output), "flag provided but not defined: -f") {
 			log.Printf("[Task %s] -f not supported, fallback to -file", taskID)
-			cmd = exec.Command(xscanPathAbs, "--output-dir", xssOutputDir, "spider", "-file", targetsFile)
+			cmd = exec.CommandContext(ctx, xscanPathAbs, "--output-dir", xssOutputDir, "spider", "-file", targetsFile)
 			cmd.Dir = xscanDir
-			output, err = cmd.CombinedOutput()
+			output, err = s.runCommand(taskID, cmd)
 		}
 		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return 0, context.Canceled
+			}
 			return 0, fmt.Errorf("xscan spider file scan failed: %w, output: %s", err, string(output))
 		}
 	}
 
-	return s.parseAndStoreXSSReports(taskID, xssOutputDir, taskDirAbs)
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return 0, context.Canceled
+	}
+
+	return s.parseAndStoreXSSReports(ctx, taskID, xssOutputDir, taskDirAbs)
 }
 
 // runXscanSingleURL runs xscan spider directly on one URL using -u.
-func (s *Scanner) runXscanSingleURL(taskID, targetURL, taskDir string) (int, error) {
+func (s *Scanner) runXscanSingleURL(ctx context.Context, taskID, targetURL, taskDir string) (int, error) {
 	taskDirAbs, err := filepath.Abs(taskDir)
 	if err != nil {
 		return 0, fmt.Errorf("failed to resolve task dir: %w", err)
@@ -506,18 +582,25 @@ func (s *Scanner) runXscanSingleURL(taskID, targetURL, taskDir string) (int, err
 	}
 
 	log.Printf("[Task %s] Scanning single URL by -u: %s", taskID, targetURL)
-	cmd := exec.Command(xscanPathAbs, "--output-dir", xssOutputDir, "spider", "-u", targetURL)
+	cmd := exec.CommandContext(ctx, xscanPathAbs, "--output-dir", xssOutputDir, "spider", "-u", targetURL)
 	cmd.Dir = xscanDir
-	output, err := cmd.CombinedOutput()
+	output, err := s.runCommand(taskID, cmd)
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return 0, context.Canceled
+		}
 		if strings.Contains(string(output), "flag provided but not defined: -u") {
 			log.Printf("[Task %s] -u not supported, fallback to file mode", taskID)
-			return s.runXscan(taskID, []string{targetURL}, taskDirAbs)
+			return s.runXscan(ctx, taskID, []string{targetURL}, taskDirAbs)
 		}
 		return 0, fmt.Errorf("xscan spider url scan failed: %w, output: %s", err, string(output))
 	}
 
-	return s.parseAndStoreXSSReports(taskID, xssOutputDir, taskDirAbs)
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return 0, context.Canceled
+	}
+
+	return s.parseAndStoreXSSReports(ctx, taskID, xssOutputDir, taskDirAbs)
 }
 
 func (s *Scanner) resolveXscanExec() (string, string, error) {
@@ -542,7 +625,7 @@ func (s *Scanner) resolveXscanExec() (string, string, error) {
 	return xscanPathAbs, filepath.Dir(xscanPathAbs), nil
 }
 
-func (s *Scanner) parseAndStoreXSSReports(taskID, xssOutputDir, taskDir string) (int, error) {
+func (s *Scanner) parseAndStoreXSSReports(ctx context.Context, taskID, xssOutputDir, taskDir string) (int, error) {
 	totalXSS := 0
 	matches, err := filepath.Glob(filepath.Join(xssOutputDir, "*_xss.md"))
 	if err != nil {
@@ -550,6 +633,10 @@ func (s *Scanner) parseAndStoreXSSReports(taskID, xssOutputDir, taskDir string) 
 	}
 
 	for _, match := range matches {
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return 0, context.Canceled
+		}
+
 		content, err := os.ReadFile(match)
 		if err != nil {
 			continue
@@ -602,6 +689,62 @@ func (s *Scanner) failTask(taskID, errMsg string) {
 		`UPDATE tasks SET status = ?, current_step = ?, error_message = ?, updated_at = ?, finished_at = ? WHERE id = ?`,
 		models.StatusFailed, "failed", errMsg, now, now, taskID,
 	)
+}
+
+func (s *Scanner) cancelTask(taskID, reason string) {
+	log.Printf("[Task %s] Cancelled: %s", taskID, reason)
+	now := time.Now()
+	database.DB.Exec(
+		`UPDATE tasks SET status = ?, current_step = ?, error_message = ?, updated_at = ?, finished_at = ? WHERE id = ?`,
+		models.StatusCancelled, "cancelled", reason, now, now, taskID,
+	)
+}
+
+func (s *Scanner) beginExecution(taskID string) context.Context {
+	ctx, cancel := context.WithCancel(context.Background())
+	s.executions[taskID] = &taskExecution{cancel: cancel}
+	return ctx
+}
+
+func (s *Scanner) endExecution(taskID string) {
+	delete(s.executions, taskID)
+}
+
+func (s *Scanner) runCommand(taskID string, cmd *exec.Cmd) ([]byte, error) {
+	s.mu.Lock()
+	if state, ok := s.executions[taskID]; ok {
+		state.cmd = cmd
+	}
+	s.mu.Unlock()
+
+	defer func() {
+		s.mu.Lock()
+		if state, ok := s.executions[taskID]; ok && state.cmd == cmd {
+			state.cmd = nil
+		}
+		s.mu.Unlock()
+	}()
+
+	return cmd.CombinedOutput()
+}
+
+func (s *Scanner) cancelExecution(taskID string) {
+	s.mu.Lock()
+	state, ok := s.executions[taskID]
+	if !ok || state == nil {
+		s.mu.Unlock()
+		return
+	}
+	cancel := state.cancel
+	cmd := state.cmd
+	s.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	if cmd != nil && cmd.Process != nil {
+		_ = cmd.Process.Kill()
+	}
 }
 
 func isValidHTTPURL(raw string) bool {

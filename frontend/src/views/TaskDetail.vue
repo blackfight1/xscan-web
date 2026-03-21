@@ -39,7 +39,7 @@
             </div>
             <div class="pline" :class="{ filled: activeStep >= 3 }"></div>
             <div :class="['ps', { active: activeStep >= 3, current: activeStep === 3 }]">
-              <div class="pi">3</div><div class="pl">XSS Scan</div><div class="pv">{{ task.xss_count }}</div>
+              <div class="pi">3</div><div class="pl">XSS Scan</div><div class="pv">{{ displayXssCount }}</div>
             </div>
             <div class="pline" :class="{ filled: activeStep >= 5 }"></div>
             <div :class="['ps', { active: activeStep >= 5 }]">
@@ -48,7 +48,7 @@
           </div>
           <div class="pipeline" v-else>
             <div :class="['ps', { active: urlStep >= 1, current: urlStep === 1 }]">
-              <div class="pi">1</div><div class="pl">XSS Scan</div><div class="pv">{{ task.xss_count }}</div>
+              <div class="pi">1</div><div class="pl">XSS Scan</div><div class="pv">{{ displayXssCount }}</div>
             </div>
             <div class="pline" :class="{ filled: urlStep >= 3 }"></div>
             <div :class="['ps', { active: urlStep >= 3 }]">
@@ -78,7 +78,7 @@
         </div>
         <div class="sc sc-xss">
           <div class="si si-xss"><el-icon :size="20"><Warning /></el-icon></div>
-          <div><div class="sn">{{ task.xss_count }}</div><div class="sl">XSS Vulns</div></div>
+          <div><div class="sn">{{ displayXssCount }}</div><div class="sl">XSS Vulns</div></div>
         </div>
         <div class="sc">
           <div class="si si-url"><el-icon :size="20"><Link /></el-icon></div>
@@ -273,12 +273,12 @@ const filteredAlive = computed(() => {
 
 const activeStep = computed(() => {
   if (!task.value) return 0
-  return { pending: 0, subdomain_collecting: 1, httpx_probing: 2, xss_scanning: 3, completed: 5, failed: -1 }[task.value.status] ?? 0
+  return { pending: 0, subdomain_collecting: 1, httpx_probing: 2, xss_scanning: 3, completed: 5, failed: -1, cancelled: -1 }[task.value.status] ?? 0
 })
 
 const urlStep = computed(() => {
   if (!task.value) return 0
-  return { pending: 0, xss_scanning: 1, completed: 3, failed: -1 }[task.value.status] ?? 0
+  return { pending: 0, xss_scanning: 1, completed: 3, failed: -1, cancelled: -1 }[task.value.status] ?? 0
 })
 
 const duration = computed(() => {
@@ -291,7 +291,26 @@ const duration = computed(() => {
 
 const xssFindings = computed(() => {
   const list = detail.value?.xss_results || []
-  return list.map((item, idx) => buildFinding(item, idx))
+  const findings = []
+
+  list.forEach((item, idx) => {
+    const blocks = splitFindingBlocks(item.report_content)
+    if (!blocks.length) {
+      findings.push(buildFinding(item, String(item.report_content || ''), idx, 0))
+      return
+    }
+    blocks.forEach((block, blockIdx) => {
+      findings.push(buildFinding(item, block, idx, blockIdx))
+    })
+  })
+
+  return findings
+})
+
+const displayXssCount = computed(() => {
+  const parsedCount = xssFindings.value.length
+  const taskCount = Number(task.value?.xss_count || 0)
+  return parsedCount > taskCount ? parsedCount : taskCount
 })
 
 const urlGroups = computed(() => {
@@ -318,6 +337,8 @@ const filteredUrlGroups = computed(() => {
     if (group.url.toLowerCase().includes(key)) return true
     return group.findings.some((finding) => {
       return (
+        String(finding.vulnUrl || '').toLowerCase().includes(key) ||
+        String(finding.type || '').toLowerCase().includes(key) ||
         String(finding.parameter || '').toLowerCase().includes(key) ||
         String(finding.payload || '').toLowerCase().includes(key) ||
         String(finding.position || '').toLowerCase().includes(key)
@@ -364,6 +385,28 @@ function toggleFinding(id) {
   openedFindingId.value = openedFindingId.value === id ? '' : id
 }
 
+function splitFindingBlocks(content) {
+  const text = String(content || '').trim()
+  if (!text) return []
+
+  const lines = text.split(/\r?\n/)
+  const starts = []
+  for (let i = 0; i < lines.length; i += 1) {
+    if (/^##\s+/.test(lines[i])) starts.push(i)
+  }
+
+  if (!starts.length) return [text]
+
+  const blocks = []
+  for (let i = 0; i < starts.length; i += 1) {
+    const start = starts[i]
+    const end = i + 1 < starts.length ? starts[i + 1] : lines.length
+    const block = lines.slice(start, end).join('\n').trim()
+    if (block) blocks.push(block)
+  }
+  return blocks
+}
+
 function sanitizeStoredURL(raw) {
   const value = String(raw || '').trim()
   if (!value) return ''
@@ -386,14 +429,26 @@ function normalizeMetaKey(key) {
 function parseTableMeta(content) {
   const meta = {}
   const lines = String(content || '').split(/\r?\n/)
+  let inFence = false
   for (const line of lines) {
-    if (!line.includes('|')) continue
+    if (line.trim().startsWith('```')) {
+      inFence = !inFence
+      continue
+    }
+    if (inFence) continue
+    if (!line.trim().startsWith('|')) continue
     const cols = line.split('|').map((item) => item.trim()).filter(Boolean)
     if (cols.length < 2) continue
     if (/^-+$/.test(cols[0]) || /^-+$/.test(cols[1])) continue
     const key = normalizeMetaKey(cols[0])
-    if (!key || key === 'key' || key === 'value') continue
-    meta[key] = cols[1]
+    const value = cols[1]
+    if (!key || key === 'value') continue
+    if (key === 'key' && normalizeMetaKey(value) === 'value') continue
+    if (key === 'key') {
+      meta.param = value
+      continue
+    }
+    meta[key] = value
   }
   return meta
 }
@@ -415,24 +470,27 @@ function hostFromUrl(value) {
   }
 }
 
-function buildFinding(item, idx) {
-  const report = String(item.report_content || '')
+function buildFinding(item, reportBlock, idx, blockIdx) {
+  const report = String(reportBlock || '').trim()
   const meta = parseTableMeta(report)
+  const titleMatch = report.match(/^##\s+([^\n]+)/m)
+  const headingUrl = titleMatch ? titleMatch[1].trim() : ''
   const storedURL = sanitizeStoredURL(item.url)
+  const headingDetectedURL = extractHttpURL(headingUrl)
   const detectedURL = extractHttpURL(report)
-  const vulnUrl = storedURL || detectedURL || `Finding #${idx + 1}`
+  const vulnUrl = headingDetectedURL || storedURL || detectedURL || `Finding #${idx + 1}`
   const parameter = pickMeta(meta, ['\u53c2\u6570\u540d', '\u53c2\u6570', 'parameter', 'param'])
   const type = pickMeta(meta, ['xss\u7c7b\u578b', 'type', 'xsstype'])
   const position = pickMeta(meta, ['xss\u4f4d\u7f6e', '\u4f4d\u7f6e', 'position'])
   const hiddenParameter = pickMeta(meta, ['\u9690\u85cf\u53c2\u6570', 'hiddenparameter', 'hidden'])
   const time = pickMeta(meta, ['\u65f6\u95f4', 'time'])
-  const payload = pickMeta(meta, ['payload'])
+  const payload = pickMeta(meta, ['\u5229\u7528payload', 'pocpayload', 'payload'])
 
   return {
-    id: item.id || `finding-${idx}`,
+    id: `${item.id || `finding-${idx}`}-${blockIdx}`,
     vulnUrl,
     host: hostFromUrl(vulnUrl),
-    title: parameter ? `${parameter} vulnerability` : `Finding #${idx + 1}`,
+    title: parameter ? `${parameter} vulnerability` : `Finding #${idx + 1}-${blockIdx + 1}`,
     parameter,
     type,
     position,
@@ -502,11 +560,11 @@ function exportCSV() {
 }
 
 function statusClass(status) {
-  return { pending: 'pending', subdomain_collecting: 'running', httpx_probing: 'running', xss_scanning: 'running', completed: 'completed', failed: 'failed' }[status] || 'pending'
+  return { pending: 'pending', subdomain_collecting: 'running', httpx_probing: 'running', xss_scanning: 'running', completed: 'completed', failed: 'failed', cancelled: 'cancelled' }[status] || 'pending'
 }
 
 function statusText(status) {
-  return { pending: 'Pending', subdomain_collecting: 'Collecting', httpx_probing: 'Probing', xss_scanning: 'Scanning', completed: 'Completed', failed: 'Failed' }[status] || status
+  return { pending: 'Pending', subdomain_collecting: 'Collecting', httpx_probing: 'Probing', xss_scanning: 'Scanning', completed: 'Completed', failed: 'Failed', cancelled: 'Cancelled' }[status] || status
 }
 
 function formatTime(value) {
@@ -555,6 +613,8 @@ onUnmounted(() => {
 .status-completed .status-dot { background:#34d399; }
 .status-failed { background:rgba(239,68,68,.15); color:#f87171; }
 .status-failed .status-dot { background:#f87171; }
+.status-cancelled { background:rgba(100,116,139,.15); color:#64748b; }
+.status-cancelled .status-dot { background:#64748b; }
 @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
 
 .header-meta { font-size:13px; color:var(--text-muted); }
