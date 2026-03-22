@@ -30,10 +30,11 @@ func main() {
 
 	// Initialize scanner
 	sc := scanner.New(scanner.Config{
-		XscanPath:     cfg.XscanPath,
-		ToolsDir:      cfg.ToolsDir,
-		ResultsDir:    cfg.ResultsDir,
-		MaxConcurrent: cfg.MaxConcurrent,
+		XscanPath:      cfg.XscanPath,
+		ToolsDir:       cfg.ToolsDir,
+		ResultsDir:     cfg.ResultsDir,
+		MaxConcurrent:  cfg.MaxConcurrent,
+		XscanBatchSize: cfg.XscanBatchSize,
 	})
 	defer sc.Stop()
 

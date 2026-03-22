@@ -6,24 +6,26 @@ import (
 )
 
 type AppConfig struct {
-	Port          int    `json:"port"`
-	DBPath        string `json:"db_path"`
-	XscanPath     string `json:"xscan_path"`
-	ToolsDir      string `json:"tools_dir"`
-	ResultsDir    string `json:"results_dir"`
-	MaxConcurrent int    `json:"max_concurrent"`
-	AuthToken     string `json:"auth_token"`
+	Port           int    `json:"port"`
+	DBPath         string `json:"db_path"`
+	XscanPath      string `json:"xscan_path"`
+	ToolsDir       string `json:"tools_dir"`
+	ResultsDir     string `json:"results_dir"`
+	MaxConcurrent  int    `json:"max_concurrent"`
+	XscanBatchSize int    `json:"xscan_batch_size"`
+	AuthToken      string `json:"auth_token"`
 }
 
 func DefaultConfig() *AppConfig {
 	return &AppConfig{
-		Port:          8080,
-		DBPath:        "./data/xscan.db",
-		XscanPath:     "./xscan/xscan",
-		ToolsDir:      "./tools",
-		ResultsDir:    "./results",
-		MaxConcurrent: 2,
-		AuthToken:     "xscan-web-token-2024",
+		Port:           8080,
+		DBPath:         "./data/xscan.db",
+		XscanPath:      "./xscan/xscan",
+		ToolsDir:       "./tools",
+		ResultsDir:     "./results",
+		MaxConcurrent:  2,
+		XscanBatchSize: 500,
+		AuthToken:      "xscan-web-token-2024",
 	}
 }
 

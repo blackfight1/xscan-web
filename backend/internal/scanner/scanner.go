@@ -22,22 +22,24 @@ import (
 )
 
 type Scanner struct {
-	xscanPath     string
-	toolsDir      string
-	resultsDir    string
-	maxConcurrent int
-	running       int
-	mu            sync.Mutex
-	taskQueue     chan string
-	quit          chan struct{}
-	executions    map[string]*taskExecution
+	xscanPath      string
+	toolsDir       string
+	resultsDir     string
+	maxConcurrent  int
+	xscanBatchSize int
+	running        int
+	mu             sync.Mutex
+	taskQueue      chan string
+	quit           chan struct{}
+	executions     map[string]*taskExecution
 }
 
 type Config struct {
-	XscanPath     string
-	ToolsDir      string
-	ResultsDir    string
-	MaxConcurrent int
+	XscanPath      string
+	ToolsDir       string
+	ResultsDir     string
+	MaxConcurrent  int
+	XscanBatchSize int
 }
 
 type taskExecution struct {
@@ -49,18 +51,22 @@ func New(cfg Config) *Scanner {
 	if cfg.MaxConcurrent <= 0 {
 		cfg.MaxConcurrent = 2
 	}
+	if cfg.XscanBatchSize <= 0 {
+		cfg.XscanBatchSize = 500
+	}
 
 	os.MkdirAll(cfg.ResultsDir, 0755)
 	os.MkdirAll(cfg.ToolsDir, 0755)
 
 	s := &Scanner{
-		xscanPath:     cfg.XscanPath,
-		toolsDir:      cfg.ToolsDir,
-		resultsDir:    cfg.ResultsDir,
-		maxConcurrent: cfg.MaxConcurrent,
-		taskQueue:     make(chan string, 100),
-		quit:          make(chan struct{}),
-		executions:    make(map[string]*taskExecution),
+		xscanPath:      cfg.XscanPath,
+		toolsDir:       cfg.ToolsDir,
+		resultsDir:     cfg.ResultsDir,
+		maxConcurrent:  cfg.MaxConcurrent,
+		xscanBatchSize: cfg.XscanBatchSize,
+		taskQueue:      make(chan string, 100),
+		quit:           make(chan struct{}),
+		executions:     make(map[string]*taskExecution),
 	}
 
 	go s.worker()
@@ -560,7 +566,7 @@ func (s *Scanner) probeAlive(ctx context.Context, taskID string, subdomains []st
 	return readLines(outputFile)
 }
 
-// runXscan runs xscan spider in batch mode using -f.
+// runXscan runs xscan spider using -f and splits large URL lists into batches.
 func (s *Scanner) runXscan(ctx context.Context, taskID string, urls []string, taskDir string) (int, error) {
 	taskDirAbs, err := filepath.Abs(taskDir)
 	if err != nil {
@@ -568,13 +574,43 @@ func (s *Scanner) runXscan(ctx context.Context, taskID string, urls []string, ta
 	}
 
 	xssOutputDir := filepath.Join(taskDirAbs, "xscan_output")
-	os.MkdirAll(xssOutputDir, 0755)
+	if err := os.MkdirAll(xssOutputDir, 0755); err != nil {
+		return 0, fmt.Errorf("failed to create xscan output dir: %w", err)
+	}
 
 	if len(urls) == 0 {
 		return 0, nil
 	}
 
-	targetsFile := filepath.Join(taskDirAbs, "xscan_targets.txt")
+	batchSize := s.xscanBatchSize
+	if batchSize <= 0 {
+		batchSize = 500
+	}
+
+	batches := chunkStrings(urls, batchSize)
+	totalXSS := 0
+
+	for batchIndex, batchURLs := range batches {
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return 0, context.Canceled
+		}
+
+		if len(batches) > 1 {
+			s.updateTaskStatus(taskID, models.StatusScanning, fmt.Sprintf("running xscan batch %d/%d (%d URLs)", batchIndex+1, len(batches), len(batchURLs)))
+		}
+
+		batchXSS, err := s.runXscanBatch(ctx, taskID, batchURLs, taskDirAbs, xssOutputDir, batchIndex, len(batches))
+		if err != nil {
+			return 0, err
+		}
+		totalXSS += batchXSS
+	}
+
+	return totalXSS, nil
+}
+
+func (s *Scanner) runXscanBatch(ctx context.Context, taskID string, urls []string, taskDirAbs, xssOutputRoot string, batchIndex, totalBatches int) (int, error) {
+	targetsFile := filepath.Join(taskDirAbs, fmt.Sprintf("xscan_targets_%03d.txt", batchIndex+1))
 	if err := os.WriteFile(targetsFile, []byte(strings.Join(urls, "\n")), 0644); err != nil {
 		return 0, fmt.Errorf("failed to write xscan targets file: %w", err)
 	}
@@ -584,8 +620,16 @@ func (s *Scanner) runXscan(ctx context.Context, taskID string, urls []string, ta
 		return 0, err
 	}
 
-	log.Printf("[Task %s] Scanning %d URLs by file: %s", taskID, len(urls), targetsFile)
-	cmd := exec.CommandContext(ctx, xscanPathAbs, "--output-dir", xssOutputDir, "spider", "-f", targetsFile)
+	batchOutputDir := xssOutputRoot
+	if totalBatches > 1 {
+		batchOutputDir = filepath.Join(xssOutputRoot, fmt.Sprintf("batch_%03d", batchIndex+1))
+		if err := os.MkdirAll(batchOutputDir, 0755); err != nil {
+			return 0, fmt.Errorf("failed to create batch output dir: %w", err)
+		}
+	}
+
+	log.Printf("[Task %s] Scanning batch %d/%d (%d URLs) by file: %s", taskID, batchIndex+1, totalBatches, len(urls), targetsFile)
+	cmd := exec.CommandContext(ctx, xscanPathAbs, "--output-dir", batchOutputDir, "spider", "-f", targetsFile)
 	cmd.Dir = xscanDir
 	output, err := s.runCommand(taskID, cmd)
 	if err != nil {
@@ -593,8 +637,8 @@ func (s *Scanner) runXscan(ctx context.Context, taskID string, urls []string, ta
 			return 0, context.Canceled
 		}
 		if strings.Contains(string(output), "flag provided but not defined: -f") {
-			log.Printf("[Task %s] -f not supported, fallback to -file", taskID)
-			cmd = exec.CommandContext(ctx, xscanPathAbs, "--output-dir", xssOutputDir, "spider", "-file", targetsFile)
+			log.Printf("[Task %s] batch %d/%d: -f not supported, fallback to -file", taskID, batchIndex+1, totalBatches)
+			cmd = exec.CommandContext(ctx, xscanPathAbs, "--output-dir", batchOutputDir, "spider", "-file", targetsFile)
 			cmd.Dir = xscanDir
 			output, err = s.runCommand(taskID, cmd)
 		}
@@ -610,7 +654,7 @@ func (s *Scanner) runXscan(ctx context.Context, taskID string, urls []string, ta
 		return 0, context.Canceled
 	}
 
-	return s.parseAndStoreXSSReports(ctx, taskID, xssOutputDir, taskDirAbs)
+	return s.parseAndStoreXSSReports(ctx, taskID, batchOutputDir, taskDirAbs)
 }
 
 // runXscanSingleURL runs xscan spider directly on one URL using -u.
@@ -697,9 +741,12 @@ func (s *Scanner) parseAndStoreXSSReports(ctx context.Context, taskID, xssOutput
 			`INSERT INTO xss_results (task_id, url, report_content) VALUES (?, ?, ?)`,
 			taskID, match, reportContent,
 		)
-		totalXSS++
+		totalXSS += countFindingsInReport(reportContent)
 
 		destName := filepath.Base(match)
+		if _, statErr := os.Stat(filepath.Join(taskDir, destName)); statErr == nil {
+			destName = filepath.Base(filepath.Dir(match)) + "_" + destName
+		}
 		destPath := filepath.Join(taskDir, destName)
 		os.WriteFile(destPath, content, 0644)
 	}
@@ -859,4 +906,37 @@ func splitUniqueLines(raw string) []string {
 	}
 
 	return lines
+}
+
+func chunkStrings(items []string, size int) [][]string {
+	if size <= 0 {
+		size = 500
+	}
+	if len(items) == 0 {
+		return nil
+	}
+
+	var chunks [][]string
+	for start := 0; start < len(items); start += size {
+		end := start + size
+		if end > len(items) {
+			end = len(items)
+		}
+		chunks = append(chunks, items[start:end])
+	}
+
+	return chunks
+}
+
+func countFindingsInReport(content string) int {
+	count := 0
+	for _, line := range strings.Split(content, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "## ") {
+			count++
+		}
+	}
+	if count == 0 && strings.TrimSpace(content) != "" {
+		return 1
+	}
+	return count
 }

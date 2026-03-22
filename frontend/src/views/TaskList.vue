@@ -316,7 +316,9 @@ async function handleCreate() {
   try {
     await createTask(payload)
     if (scanMode.value === 'domain' && lines.length > 1) {
-      ElMessage.success(`${lines.length} tasks created`)
+      ElMessage.success(`Batch task created for ${lines.length} domains`)
+    } else if (scanMode.value === 'url' && lines.length > 1) {
+      ElMessage.success(`Batch task created for ${lines.length} URLs`)
     } else {
       ElMessage.success('Task created')
     }
@@ -777,5 +779,4 @@ onUnmounted(() => {
   .scan-btn { min-width: auto; width: 100%; }
 }
 </style>
-
 
