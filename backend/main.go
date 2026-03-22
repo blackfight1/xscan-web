@@ -78,6 +78,7 @@ func main() {
 		api.POST("/tasks", h.CreateTask)
 		api.GET("/tasks", h.GetTasks)
 		api.GET("/tasks/:id", h.GetTask)
+		api.GET("/tasks/:id/status", h.GetTaskStatus)
 		api.DELETE("/tasks/:id", h.DeleteTask)
 		api.GET("/tasks/:id/report", h.GetReport)
 	}

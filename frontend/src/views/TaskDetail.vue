@@ -236,7 +236,7 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRoute } from 'vue-router'
-import { getTask, getReport } from '../api'
+import { getTask, getTaskStatus, getReport } from '../api'
 import { marked } from 'marked'
 import { ElMessage } from 'element-plus'
 
@@ -501,7 +501,7 @@ function buildFinding(item, reportBlock, idx, blockIdx) {
   }
 }
 
-async function load() {
+async function loadDetail() {
   try {
     const data = await getTask(taskId)
     task.value = data.task
@@ -513,6 +513,30 @@ async function load() {
     if (task.value?.scan_mode === 'url' && tab.value === 'sub') tab.value = 'xss'
   } catch {
     ElMessage.error('Failed to load task')
+  }
+}
+
+async function refreshStatus() {
+  try {
+    const wasRunning = isRunning.value
+    const data = await getTaskStatus(taskId)
+    task.value = data.task
+
+    if (task.value?.scan_mode === 'url' && tab.value === 'sub') tab.value = 'xss'
+
+    if (!isRunning.value && timer) {
+      clearInterval(timer)
+      timer = null
+    }
+
+    if (wasRunning && !isRunning.value) {
+      await loadDetail()
+    }
+  } catch {
+    if (timer) {
+      clearInterval(timer)
+      timer = null
+    }
   }
 }
 
@@ -529,10 +553,52 @@ async function loadReport() {
 
 function renderMd(content) {
   try {
-    return content ? marked(content) : ''
+    return content ? sanitizeRenderedHtml(marked.parse(content)) : ''
   } catch {
-    return content
+    return sanitizeRenderedHtml(String(content || ''))
   }
+}
+
+function sanitizeRenderedHtml(html) {
+  const template = document.createElement('template')
+  template.innerHTML = String(html || '')
+
+  const blockedTags = new Set(['script', 'iframe', 'object', 'embed', 'link', 'style', 'meta', 'base', 'form', 'input', 'button', 'textarea', 'select', 'option'])
+  const walker = document.createTreeWalker(template.content, NodeFilter.SHOW_ELEMENT)
+  const toRemove = []
+
+  while (walker.nextNode()) {
+    const el = walker.currentNode
+    const tag = el.tagName.toLowerCase()
+    if (blockedTags.has(tag)) {
+      toRemove.push(el)
+      continue
+    }
+
+    for (const attr of Array.from(el.attributes)) {
+      const name = attr.name.toLowerCase()
+      const value = String(attr.value || '').trim()
+
+      if (name.startsWith('on') || name === 'style') {
+        el.removeAttribute(attr.name)
+        continue
+      }
+
+      if ((name === 'href' || name === 'src' || name === 'xlink:href') && /^(javascript|data|vbscript):/i.test(value)) {
+        el.removeAttribute(attr.name)
+      }
+    }
+
+    if (tag === 'a') {
+      el.setAttribute('rel', 'noopener noreferrer nofollow')
+      if (el.getAttribute('target') === '_blank') {
+        el.setAttribute('target', '_blank')
+      }
+    }
+  }
+
+  toRemove.forEach((el) => el.remove())
+  return template.innerHTML
 }
 
 function csvEscape(value) {
@@ -575,10 +641,12 @@ function formatTime(value) {
 
 onMounted(() => {
   loading.value = true
-  load().finally(() => {
+  loadDetail().finally(() => {
     loading.value = false
+    if (isRunning.value && !timer) {
+      timer = setInterval(refreshStatus, 5000)
+    }
   })
-  timer = setInterval(load, 5000)
 })
 
 onUnmounted(() => {

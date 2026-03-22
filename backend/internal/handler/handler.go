@@ -154,6 +154,17 @@ func (h *Handler) GetTask(c *gin.Context) {
 	c.JSON(http.StatusOK, detail)
 }
 
+// GetTaskStatus GET /api/tasks/:id/status
+func (h *Handler) GetTaskStatus(c *gin.Context) {
+	id := c.Param("id")
+	task, err := h.scanner.GetTask(id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Task not found"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"task": task})
+}
+
 // DeleteTask DELETE /api/tasks/:id
 func (h *Handler) DeleteTask(c *gin.Context) {
 	id := c.Param("id")

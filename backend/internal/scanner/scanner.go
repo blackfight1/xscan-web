@@ -183,9 +183,6 @@ func (s *Scanner) CreateTask(scanMode, rootDomain, targetURL string) (*models.Ta
 	rootDomain = strings.TrimSpace(rootDomain)
 	targetURL = strings.TrimSpace(targetURL)
 	displayTarget := rootDomain
-	if mode == models.ScanModeURL {
-		displayTarget = targetURL
-	}
 
 	id := uuid.New().String()[:8]
 	now := time.Now()
@@ -544,9 +541,7 @@ func (s *Scanner) collectSubdomains(ctx context.Context, taskID string, domains 
 				return nil, context.Canceled
 			}
 			log.Printf("[Subfinder] Error: %v, Output: %s", err, string(output))
-			if writeErr := os.WriteFile(outputFile, []byte(domains[0]+"\n"), 0644); writeErr != nil {
-				return nil, writeErr
-			}
+			return nil, fmt.Errorf("subfinder failed: %w, output: %s", err, string(output))
 		}
 		return readLines(outputFile)
 	}
@@ -568,7 +563,7 @@ func (s *Scanner) collectSubdomains(ctx context.Context, taskID string, domains 
 			return nil, context.Canceled
 		}
 		log.Printf("[Subfinder] Batch error: %v, Output: %s", err, string(output))
-		return domains, nil
+		return nil, fmt.Errorf("subfinder batch failed: %w, output: %s", err, string(output))
 	}
 
 	subdomains, err := readLinesFromDir(outputDir)
@@ -576,7 +571,7 @@ func (s *Scanner) collectSubdomains(ctx context.Context, taskID string, domains 
 		return nil, err
 	}
 	if len(subdomains) == 0 {
-		return domains, nil
+		return nil, fmt.Errorf("subfinder returned no subdomains")
 	}
 
 	return subdomains, nil
@@ -614,16 +609,7 @@ func (s *Scanner) probeAlive(ctx context.Context, taskID string, subdomains []st
 			return nil, context.Canceled
 		}
 		log.Printf("[Httpx] Error: %v, Output: %s", err, string(output))
-		var urls []string
-		for _, sub := range subdomains {
-			if !strings.HasPrefix(sub, "http") {
-				urls = append(urls, "https://"+sub)
-			} else {
-				urls = append(urls, sub)
-			}
-		}
-		urlContent := strings.Join(urls, "\n")
-		os.WriteFile(outputFile, []byte(urlContent), 0644)
+		return nil, fmt.Errorf("httpx failed: %w, output: %s", err, string(output))
 	}
 
 	return readLines(outputFile)
@@ -800,11 +786,27 @@ func (s *Scanner) parseAndStoreXSSReports(ctx context.Context, taskID, xssOutput
 			continue
 		}
 
-		database.DB.Exec(
-			`INSERT INTO xss_results (task_id, url, report_content) VALUES (?, ?, ?)`,
-			taskID, match, reportContent,
-		)
-		totalXSS += countFindingsInReport(reportContent)
+		findingBlocks := splitFindingBlocks(reportContent)
+		if len(findingBlocks) == 0 {
+			findingBlocks = []string{reportContent}
+		}
+
+		for _, block := range findingBlocks {
+			if errors.Is(ctx.Err(), context.Canceled) {
+				return 0, context.Canceled
+			}
+
+			finding := parseFindingBlock(block)
+			if strings.TrimSpace(finding.ReportContent) == "" {
+				continue
+			}
+
+			database.DB.Exec(
+				`INSERT INTO xss_results (task_id, url, payload, param, position, report_content) VALUES (?, ?, ?, ?, ?, ?)`,
+				taskID, finding.URL, finding.Payload, finding.Param, finding.Position, finding.ReportContent,
+			)
+			totalXSS++
+		}
 
 		destName := filepath.Base(match)
 		if _, statErr := os.Stat(filepath.Join(taskDir, destName)); statErr == nil {
@@ -1002,4 +1004,155 @@ func countFindingsInReport(content string) int {
 		return 1
 	}
 	return count
+}
+
+type parsedFinding struct {
+	URL           string
+	Param         string
+	Payload       string
+	Position      string
+	ReportContent string
+}
+
+func splitFindingBlocks(content string) []string {
+	text := strings.TrimSpace(content)
+	if text == "" {
+		return nil
+	}
+
+	lines := strings.Split(text, "\n")
+	var starts []int
+	for i, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), "## ") {
+			starts = append(starts, i)
+		}
+	}
+
+	if len(starts) == 0 {
+		return []string{text}
+	}
+
+	var blocks []string
+	for i, start := range starts {
+		end := len(lines)
+		if i+1 < len(starts) {
+			end = starts[i+1]
+		}
+
+		block := strings.TrimSpace(strings.Join(lines[start:end], "\n"))
+		if block != "" {
+			blocks = append(blocks, block)
+		}
+	}
+
+	return blocks
+}
+
+func parseFindingBlock(block string) parsedFinding {
+	report := strings.TrimSpace(block)
+	meta := parseMarkdownTableMeta(report)
+
+	title := ""
+	for _, line := range strings.Split(report, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "## ") {
+			title = strings.TrimSpace(strings.TrimPrefix(line, "## "))
+			break
+		}
+	}
+
+	findingURL := extractHTTPURL(title)
+	if findingURL == "" {
+		findingURL = extractHTTPURL(report)
+	}
+
+	return parsedFinding{
+		URL:           findingURL,
+		Param:         pickMetaValue(meta, "参数名", "参数", "parameter", "param"),
+		Payload:       pickMetaValue(meta, "利用payload", "pocpayload", "payload"),
+		Position:      pickMetaValue(meta, "xss位置", "位置", "position"),
+		ReportContent: report,
+	}
+}
+
+func parseMarkdownTableMeta(content string) map[string]string {
+	meta := make(map[string]string)
+	lines := strings.Split(content, "\n")
+	inFence := false
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "```") {
+			inFence = !inFence
+			continue
+		}
+		if inFence || !strings.HasPrefix(trimmed, "|") {
+			continue
+		}
+
+		rawCols := strings.Split(trimmed, "|")
+		var cols []string
+		for _, col := range rawCols {
+			col = strings.TrimSpace(col)
+			if col != "" {
+				cols = append(cols, col)
+			}
+		}
+		if len(cols) < 2 {
+			continue
+		}
+		if isMarkdownSeparator(cols[0]) || isMarkdownSeparator(cols[1]) {
+			continue
+		}
+
+		key := normalizeMetaKey(cols[0])
+		value := cols[1]
+		if key == "" || key == "value" {
+			continue
+		}
+		if key == "key" {
+			meta["param"] = value
+			continue
+		}
+		meta[key] = value
+	}
+
+	return meta
+}
+
+func normalizeMetaKey(value string) string {
+	replacer := strings.NewReplacer(" ", "", "_", "", "-", "", ":", "")
+	return strings.ToLower(replacer.Replace(strings.TrimSpace(value)))
+}
+
+func pickMetaValue(meta map[string]string, keys ...string) string {
+	for _, key := range keys {
+		if value := meta[normalizeMetaKey(key)]; value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func isMarkdownSeparator(value string) bool {
+	value = strings.TrimSpace(strings.ReplaceAll(value, "|", ""))
+	if value == "" {
+		return false
+	}
+	for _, ch := range value {
+		if ch != '-' && ch != ':' {
+			return false
+		}
+	}
+	return true
+}
+
+func extractHTTPURL(text string) string {
+	for _, field := range strings.Fields(text) {
+		candidate := strings.Trim(field, " \t\r\n\"'()<>[],")
+		if isValidHTTPURL(candidate) {
+			return candidate
+		}
+	}
+	return ""
 }

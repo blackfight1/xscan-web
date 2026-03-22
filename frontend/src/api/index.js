@@ -50,6 +50,10 @@ export function getTask(id) {
     return api.get(`/tasks/${id}`)
 }
 
+export function getTaskStatus(id) {
+    return api.get(`/tasks/${id}/status`)
+}
+
 export function deleteTask(id) {
     return api.delete(`/tasks/${id}`)
 }

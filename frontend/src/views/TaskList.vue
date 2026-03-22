@@ -23,7 +23,7 @@
           <div class="mode-desc">
             <template v-if="scanMode === 'domain'">
               <span class="desc-icon">D</span>
-              <span>Subfinder -> Httpx -> XScan full pipeline. Enter one domain per line. Each domain creates a separate task.</span>
+              <span>Subfinder -> Httpx -> XScan full pipeline. Enter one domain per line. Multiple domains are merged into one batch task.</span>
             </template>
             <template v-else>
               <span class="desc-icon">U</span>
@@ -779,4 +779,3 @@ onUnmounted(() => {
   .scan-btn { min-width: auto; width: 100%; }
 }
 </style>
-
