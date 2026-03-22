@@ -70,6 +70,7 @@ func New(cfg Config) *Scanner {
 	}
 
 	go s.worker()
+	go s.recoverTasks()
 	return s
 }
 
@@ -108,6 +109,68 @@ func (s *Scanner) Stop() {
 		cancel()
 	}
 	close(s.quit)
+}
+
+func (s *Scanner) recoverTasks() {
+	rows, err := database.DB.Query(
+		`SELECT id, status FROM tasks
+		 WHERE status IN (?, ?, ?, ?)
+		 ORDER BY created_at ASC`,
+		models.StatusPending,
+		models.StatusSubdomain,
+		models.StatusHttpx,
+		models.StatusScanning,
+	)
+	if err != nil {
+		log.Printf("Failed to recover tasks: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	var pendingIDs []string
+	var interruptedIDs []string
+
+	for rows.Next() {
+		var taskID string
+		var status string
+		if err := rows.Scan(&taskID, &status); err != nil {
+			continue
+		}
+
+		if status == models.StatusPending {
+			pendingIDs = append(pendingIDs, taskID)
+			continue
+		}
+
+		now := time.Now()
+		_, err := database.DB.Exec(
+			`UPDATE tasks
+			 SET status = ?, current_step = ?, error_message = ?, updated_at = ?, finished_at = ?
+			 WHERE id = ?`,
+			models.StatusFailed,
+			"failed",
+			"task interrupted by service restart or process termination",
+			now,
+			now,
+			taskID,
+		)
+		if err == nil {
+			interruptedIDs = append(interruptedIDs, taskID)
+		}
+	}
+
+	if len(interruptedIDs) > 0 {
+		log.Printf("Recovered %d interrupted tasks as failed", len(interruptedIDs))
+	}
+
+	for _, taskID := range pendingIDs {
+		select {
+		case <-s.quit:
+			return
+		case s.taskQueue <- taskID:
+			log.Printf("[Task %s] Re-queued pending task after service restart", taskID)
+		}
+	}
 }
 
 // CreateTask creates a new task and enqueues it.
