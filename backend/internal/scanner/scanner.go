@@ -52,7 +52,7 @@ func New(cfg Config) *Scanner {
 		cfg.MaxConcurrent = 2
 	}
 	if cfg.XscanBatchSize <= 0 {
-		cfg.XscanBatchSize = 500
+		cfg.XscanBatchSize = 200
 	}
 
 	os.MkdirAll(cfg.ResultsDir, 0755)
@@ -647,7 +647,7 @@ func (s *Scanner) runXscan(ctx context.Context, taskID string, urls []string, ta
 
 	batchSize := s.xscanBatchSize
 	if batchSize <= 0 {
-		batchSize = 500
+		batchSize = 200
 	}
 
 	batches := chunkStrings(urls, batchSize)
@@ -973,7 +973,7 @@ func splitUniqueLines(raw string) []string {
 
 func chunkStrings(items []string, size int) [][]string {
 	if size <= 0 {
-		size = 500
+		size = 200
 	}
 	if len(items) == 0 {
 		return nil

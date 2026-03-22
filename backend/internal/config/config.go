@@ -24,7 +24,7 @@ func DefaultConfig() *AppConfig {
 		ToolsDir:       "./tools",
 		ResultsDir:     "./results",
 		MaxConcurrent:  2,
-		XscanBatchSize: 500,
+		XscanBatchSize: 200,
 		AuthToken:      "xscan-web-token-2024",
 	}
 }

@@ -5,5 +5,6 @@
     "tools_dir": "./tools",
     "results_dir": "./results",
     "max_concurrent": 2,
+    "xscan_batch_size": 200,
     "auth_token": ""
 }
