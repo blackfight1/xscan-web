@@ -373,10 +373,12 @@ function statusText(status) {
 }
 
 function taskStatusClass(task) {
+  if (task?.is_suspected_abnormal) return 'suspected'
   return statusClass(task?.status)
 }
 
 function taskStatusText(task) {
+  if (task?.is_suspected_abnormal) return 'Suspected abnormal'
   return statusText(task?.status)
 }
 
@@ -389,14 +391,33 @@ function formatRelativeTime(value) {
   return `${Math.floor(diffSec / 86400)}d ago`
 }
 
+function formatElapsed(value) {
+  if (!value) return '-'
+  const diffSec = Math.max(0, Math.floor((Date.now() - new Date(value).getTime()) / 1000))
+  if (diffSec < 60) return `${diffSec}s`
+  if (diffSec < 3600) return `${Math.floor(diffSec / 60)}m`
+  if (diffSec < 86400) return `${Math.floor(diffSec / 3600)}h`
+  return `${Math.floor(diffSec / 86400)}d`
+}
+
 function taskProgressText(task) {
   if (!task) return '-'
   const parts = []
   if (task.total_batches > 0) {
     parts.push(`Batch ${Math.max(0, task.current_batch)}/${task.total_batches}`)
   }
-  if (!parts.length && task.worker_started_at) {
-    parts.push(`Started ${formatRelativeTime(task.worker_started_at)}`)
+  if (task.last_output_at) {
+    parts.push(
+      task.is_suspected_abnormal
+        ? `No output for ${formatElapsed(task.last_output_at)}`
+        : `Last activity ${formatRelativeTime(task.last_output_at)}`
+    )
+  } else if (task.worker_started_at) {
+    parts.push(
+      task.is_suspected_abnormal
+        ? `No output for ${formatElapsed(task.worker_started_at)}`
+        : `Started ${formatRelativeTime(task.worker_started_at)}`
+    )
   }
   return parts.join(' | ') || '-'
 }
@@ -727,6 +748,8 @@ onUnmounted(() => {
 .status-failed .status-dot { background: #f87171; }
 .status-cancelled { background: rgba(100, 116, 139, 0.15); color: #64748b; }
 .status-cancelled .status-dot { background: #64748b; }
+.status-suspected { background: rgba(249, 115, 22, 0.16); color: #fb923c; }
+.status-suspected .status-dot { background: #fb923c; }
 @keyframes pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: .4; }

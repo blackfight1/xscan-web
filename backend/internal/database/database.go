@@ -51,6 +51,8 @@ func createTables() {
 		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		worker_started_at DATETIME,
 		last_heartbeat_at DATETIME,
+		last_output_at DATETIME,
+		recent_log TEXT DEFAULT '',
 		finished_at DATETIME
 	);
 
@@ -122,6 +124,16 @@ func ensureTaskColumns() {
 	_, err = DB.Exec("ALTER TABLE tasks ADD COLUMN last_heartbeat_at DATETIME")
 	if err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 		log.Fatalf("Failed to add tasks.last_heartbeat_at: %v", err)
+	}
+
+	_, err = DB.Exec("ALTER TABLE tasks ADD COLUMN last_output_at DATETIME")
+	if err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		log.Fatalf("Failed to add tasks.last_output_at: %v", err)
+	}
+
+	_, err = DB.Exec("ALTER TABLE tasks ADD COLUMN recent_log TEXT DEFAULT ''")
+	if err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		log.Fatalf("Failed to add tasks.recent_log: %v", err)
 	}
 }
 

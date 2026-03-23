@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/url"
 	"os"
@@ -43,9 +44,16 @@ type Config struct {
 }
 
 type taskExecution struct {
-	cancel context.CancelFunc
-	cmd    *exec.Cmd
+	cancel    context.CancelFunc
+	cmd       *exec.Cmd
+	recentLog []string
 }
+
+const (
+	scanOutputQuietThreshold  = 10 * time.Minute
+	stageOutputQuietThreshold = 5 * time.Minute
+	maxRecentLogLines         = 120
+)
 
 func New(cfg Config) *Scanner {
 	if cfg.MaxConcurrent <= 0 {
@@ -219,17 +227,19 @@ func (s *Scanner) GetTask(id string) (*models.Task, error) {
 	task := &models.Task{}
 	var finishedAt sql.NullTime
 	var workerStartedAt sql.NullTime
+	var lastOutputAt sql.NullTime
+	var recentLog sql.NullString
 
 	err := database.DB.QueryRow(
 		`SELECT id, scan_mode, root_domain, target_url, status, subdomain_count, alive_count, xss_count,
-		        current_step, error_message, current_batch, total_batches, created_at, updated_at, worker_started_at, finished_at
+		        current_step, error_message, current_batch, total_batches, created_at, updated_at, worker_started_at, last_output_at, recent_log, finished_at
 		 FROM tasks WHERE id = ?`,
 		id,
 	).Scan(
 		&task.ID, &task.ScanMode, &task.RootDomain, &task.TargetURL, &task.Status,
 		&task.SubdomainCount, &task.AliveCount, &task.XssCount,
 		&task.CurrentStep, &task.ErrorMessage, &task.CurrentBatch, &task.TotalBatches,
-		&task.CreatedAt, &task.UpdatedAt, &workerStartedAt, &finishedAt,
+		&task.CreatedAt, &task.UpdatedAt, &workerStartedAt, &lastOutputAt, &recentLog, &finishedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -238,9 +248,16 @@ func (s *Scanner) GetTask(id string) (*models.Task, error) {
 	if workerStartedAt.Valid {
 		task.WorkerStartedAt = &workerStartedAt.Time
 	}
+	if lastOutputAt.Valid {
+		task.LastOutputAt = &lastOutputAt.Time
+	}
+	if recentLog.Valid {
+		task.RecentLog = recentLog.String
+	}
 	if finishedAt.Valid {
 		task.FinishedAt = &finishedAt.Time
 	}
+	applyDerivedTaskState(task)
 	return task, nil
 }
 
@@ -248,7 +265,7 @@ func (s *Scanner) GetTask(id string) (*models.Task, error) {
 func (s *Scanner) GetTasks() ([]models.Task, error) {
 	rows, err := database.DB.Query(
 		`SELECT id, scan_mode, root_domain, target_url, status, subdomain_count, alive_count, xss_count,
-		        current_step, error_message, current_batch, total_batches, created_at, updated_at, worker_started_at, finished_at
+		        current_step, error_message, current_batch, total_batches, created_at, updated_at, worker_started_at, last_output_at, recent_log, finished_at
 		 FROM tasks ORDER BY created_at DESC`,
 	)
 	if err != nil {
@@ -261,11 +278,13 @@ func (s *Scanner) GetTasks() ([]models.Task, error) {
 		var task models.Task
 		var finishedAt sql.NullTime
 		var workerStartedAt sql.NullTime
+		var lastOutputAt sql.NullTime
+		var recentLog sql.NullString
 		err := rows.Scan(
 			&task.ID, &task.ScanMode, &task.RootDomain, &task.TargetURL, &task.Status,
 			&task.SubdomainCount, &task.AliveCount, &task.XssCount,
 			&task.CurrentStep, &task.ErrorMessage, &task.CurrentBatch, &task.TotalBatches,
-			&task.CreatedAt, &task.UpdatedAt, &workerStartedAt, &finishedAt,
+			&task.CreatedAt, &task.UpdatedAt, &workerStartedAt, &lastOutputAt, &recentLog, &finishedAt,
 		)
 		if err != nil {
 			continue
@@ -273,9 +292,16 @@ func (s *Scanner) GetTasks() ([]models.Task, error) {
 		if workerStartedAt.Valid {
 			task.WorkerStartedAt = &workerStartedAt.Time
 		}
+		if lastOutputAt.Valid {
+			task.LastOutputAt = &lastOutputAt.Time
+		}
+		if recentLog.Valid {
+			task.RecentLog = recentLog.String
+		}
 		if finishedAt.Valid {
 			task.FinishedAt = &finishedAt.Time
 		}
+		applyDerivedTaskState(&task)
 		tasks = append(tasks, task)
 	}
 	return tasks, nil
@@ -875,9 +901,14 @@ func (s *Scanner) cancelTask(taskID, reason string) {
 
 func (s *Scanner) markTaskStarted(taskID string) {
 	now := time.Now()
+	s.mu.Lock()
+	if state, ok := s.executions[taskID]; ok && state != nil {
+		state.recentLog = nil
+	}
+	s.mu.Unlock()
 	database.DB.Exec(
 		`UPDATE tasks
-		 SET updated_at = ?, worker_started_at = ?, current_batch = 0, total_batches = 0
+		 SET updated_at = ?, worker_started_at = ?, last_output_at = NULL, recent_log = '', current_batch = 0, total_batches = 0
 		 WHERE id = ?`,
 		now, now, taskID,
 	)
@@ -918,7 +949,75 @@ func (s *Scanner) runCommand(taskID string, cmd *exec.Cmd) ([]byte, error) {
 		s.mu.Unlock()
 	}()
 
-	return cmd.CombinedOutput()
+	reader, writer := io.Pipe()
+	cmd.Stdout = writer
+	cmd.Stderr = writer
+
+	var output strings.Builder
+	done := make(chan struct{})
+	go s.captureCommandOutput(taskID, reader, &output, done)
+
+	if err := cmd.Start(); err != nil {
+		_ = writer.Close()
+		<-done
+		_ = reader.Close()
+		return nil, err
+	}
+
+	waitErr := cmd.Wait()
+	_ = writer.Close()
+
+	<-done
+	_ = reader.Close()
+
+	return []byte(output.String()), waitErr
+}
+
+func (s *Scanner) captureCommandOutput(taskID string, reader *io.PipeReader, output *strings.Builder, done chan<- struct{}) {
+	defer close(done)
+
+	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if output.Len() > 0 {
+			output.WriteByte('\n')
+		}
+		output.WriteString(line)
+		s.recordTaskOutput(taskID, line)
+	}
+
+	if err := scanner.Err(); err != nil && !errors.Is(err, io.ErrClosedPipe) {
+		log.Printf("[Task %s] Failed to read command output: %v", taskID, err)
+	}
+}
+
+func (s *Scanner) recordTaskOutput(taskID, line string) {
+	cleaned := strings.TrimSpace(strings.TrimRight(line, "\r"))
+	if cleaned == "" {
+		return
+	}
+
+	now := time.Now()
+	recentLog := cleaned
+
+	s.mu.Lock()
+	if state, ok := s.executions[taskID]; ok && state != nil {
+		state.recentLog = append(state.recentLog, cleaned)
+		if len(state.recentLog) > maxRecentLogLines {
+			state.recentLog = append([]string(nil), state.recentLog[len(state.recentLog)-maxRecentLogLines:]...)
+		}
+		recentLog = strings.Join(state.recentLog, "\n")
+	}
+	s.mu.Unlock()
+
+	if _, err := database.DB.Exec(
+		`UPDATE tasks SET last_output_at = ?, recent_log = ? WHERE id = ?`,
+		now, recentLog, taskID,
+	); err != nil {
+		log.Printf("[Task %s] Failed to persist command output: %v", taskID, err)
+	}
 }
 
 func (s *Scanner) cancelExecution(taskID string) {
@@ -938,6 +1037,44 @@ func (s *Scanner) cancelExecution(taskID string) {
 	if cmd != nil && cmd.Process != nil {
 		_ = cmd.Process.Kill()
 	}
+}
+
+func applyDerivedTaskState(task *models.Task) {
+	if task == nil {
+		return
+	}
+
+	task.IsSuspectedAbnormal = false
+	if !isOutputTrackedStatus(task.Status) {
+		return
+	}
+
+	reference := task.UpdatedAt
+	if task.LastOutputAt != nil {
+		reference = *task.LastOutputAt
+	} else if task.WorkerStartedAt != nil {
+		reference = *task.WorkerStartedAt
+	}
+
+	if time.Since(reference) > outputQuietThresholdFor(task.Status) {
+		task.IsSuspectedAbnormal = true
+	}
+}
+
+func isOutputTrackedStatus(status string) bool {
+	switch status {
+	case models.StatusSubdomain, models.StatusHttpx, models.StatusScanning:
+		return true
+	default:
+		return false
+	}
+}
+
+func outputQuietThresholdFor(status string) time.Duration {
+	if status == models.StatusScanning {
+		return scanOutputQuietThreshold
+	}
+	return stageOutputQuietThreshold
 }
 
 func isValidHTTPURL(raw string) bool {

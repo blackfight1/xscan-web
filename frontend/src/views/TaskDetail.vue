@@ -56,14 +56,14 @@
             </div>
           </div>
 
-          <div class="cur-step" v-if="task.current_step && isRunning">
+          <div class="cur-step" v-if="task.current_step && (isRunning || task.is_suspected_abnormal)">
             <div class="pulse-dot"></div>
             <span>{{ task.current_step }}</span>
           </div>
-          <div class="heartbeat-bar" v-if="taskBatchText || taskProgressText">
+          <div class="activity-bar" v-if="taskBatchText || taskActivityText">
             <span v-if="taskBatchText">{{ taskBatchText }}</span>
-            <span v-if="taskBatchText && taskProgressText" class="sep">|</span>
-            <span v-if="taskProgressText">{{ taskProgressText }}</span>
+            <span v-if="taskBatchText && taskActivityText" class="sep">|</span>
+            <span v-if="taskActivityText">{{ taskActivityText }}</span>
           </div>
           <div class="err-bar" v-if="task.error_message">
             <el-icon color="#f87171"><WarningFilled /></el-icon>
@@ -89,6 +89,16 @@
           <div class="si si-url"><el-icon :size="20"><Link /></el-icon></div>
           <div><div class="sn">{{ urlGroups.length }}</div><div class="sl">Vulnerable URLs</div></div>
         </div>
+      </div>
+
+      <div class="output-box">
+        <div class="output-head">
+          <div>
+            <h3>{{ outputPanelTitle }}</h3>
+            <p>{{ outputPanelSubtitle }}</p>
+          </div>
+        </div>
+        <pre class="output-log">{{ outputLogText }}</pre>
       </div>
 
       <div class="content-box">
@@ -299,12 +309,16 @@ const taskBatchText = computed(() => {
   return `Batch ${Math.max(0, task.value.current_batch || 0)}/${task.value.total_batches}`
 })
 
-const taskProgressText = computed(() => {
-  if (task.value?.worker_started_at) {
-    return `Started ${formatRelativeTime(task.value.worker_started_at)}`
-  }
-  return ''
+const taskActivityText = computed(() => buildActivityText(task.value))
+
+const outputPanelTitle = computed(() => (isRunning.value ? 'Real-time Output' : 'Recent Output'))
+
+const outputPanelSubtitle = computed(() => {
+  if (!task.value) return 'No task data'
+  return taskActivityText.value || 'No output captured yet'
 })
+
+const outputLogText = computed(() => task.value?.recent_log || 'No output captured yet')
 
 const xssFindings = computed(() => {
   const list = detail.value?.xss_results || []
@@ -585,6 +599,25 @@ function formatRelativeTime(value) {
   return `${Math.floor(diffSec / 86400)}d`
 }
 
+function formatElapsed(value) {
+  return formatRelativeTime(value)
+}
+
+function buildActivityText(taskItem) {
+  if (!taskItem) return ''
+  if (taskItem.last_output_at) {
+    return taskItem.is_suspected_abnormal
+      ? `No output for ${formatElapsed(taskItem.last_output_at)}`
+      : `Last activity ${formatRelativeTime(taskItem.last_output_at)} ago`
+  }
+  if (taskItem.worker_started_at) {
+    return taskItem.is_suspected_abnormal
+      ? `No output for ${formatElapsed(taskItem.worker_started_at)}`
+      : `Started ${formatRelativeTime(taskItem.worker_started_at)} ago`
+  }
+  return ''
+}
+
 function sanitizeRenderedHtml(html) {
   const template = document.createElement('template')
   template.innerHTML = String(html || '')
@@ -660,10 +693,12 @@ function statusText(status) {
 }
 
 function taskStatusClass(taskItem) {
+  if (taskItem?.is_suspected_abnormal) return 'suspected'
   return statusClass(taskItem?.status)
 }
 
 function taskStatusText(taskItem) {
+  if (taskItem?.is_suspected_abnormal) return 'Suspected abnormal'
   return statusText(taskItem?.status)
 }
 
@@ -717,6 +752,8 @@ onUnmounted(() => {
 .status-failed .status-dot { background:#f87171; }
 .status-cancelled { background:rgba(100,116,139,.15); color:#64748b; }
 .status-cancelled .status-dot { background:#64748b; }
+.status-suspected { background:rgba(249,115,22,.16); color:#fb923c; }
+.status-suspected .status-dot { background:#fb923c; }
 @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
 
 .header-meta { font-size:13px; color:var(--text-muted); }
@@ -735,7 +772,7 @@ onUnmounted(() => {
 
 .cur-step { display:flex; align-items:center; gap:10px; padding:12px 16px; background:rgba(245,158,11,.08); border:1px solid rgba(245,158,11,.2); border-radius:10px; font-size:13px; color:#fbbf24; margin-top:16px; }
 .pulse-dot { width:8px; height:8px; border-radius:50%; background:#fbbf24; animation:pulse 1.5s infinite; flex-shrink:0; }
-.heartbeat-bar { display:flex; align-items:center; gap:8px; padding:10px 16px; background:rgba(14,165,233,.08); border:1px solid rgba(14,165,233,.18); border-radius:10px; font-size:12px; color:#7dd3fc; margin-top:12px; flex-wrap:wrap; }
+.activity-bar { display:flex; align-items:center; gap:8px; padding:10px 16px; background:rgba(14,165,233,.08); border:1px solid rgba(14,165,233,.18); border-radius:10px; font-size:12px; color:#7dd3fc; margin-top:12px; flex-wrap:wrap; }
 .err-bar { display:flex; align-items:center; gap:10px; padding:12px 16px; background:rgba(239,68,68,.08); border:1px solid rgba(239,68,68,.2); border-radius:10px; font-size:13px; color:#fca5a5; margin-top:16px; }
 
 /* Stats */
@@ -749,6 +786,12 @@ onUnmounted(() => {
 .sn { font-size:24px; font-weight:700; color:var(--text-primary); }
 .sl { font-size:12px; color:var(--text-muted); text-transform:uppercase; letter-spacing:.5px; }
 .sc-xss { border-color:rgba(239,68,68,.2); }
+
+.output-box { background:var(--bg-card); border:1px solid var(--border-color); border-radius:16px; overflow:hidden; }
+.output-head { display:flex; align-items:center; justify-content:space-between; padding:18px 22px; border-bottom:1px solid var(--border-color); background:rgba(0,212,255,.04); }
+.output-head h3 { font-size:16px; font-weight:600; color:var(--text-primary); }
+.output-head p { margin-top:4px; font-size:12px; color:var(--text-muted); }
+.output-log { margin:0; padding:18px 22px; min-height:180px; max-height:360px; overflow:auto; background:rgba(15,23,42,.22); color:#cbd5e1; font-size:12px; line-height:1.65; white-space:pre-wrap; word-break:break-word; font-family:'JetBrains Mono', monospace; }
 
 /* Tabs */
 .content-box { background:var(--bg-card); border:1px solid var(--border-color); border-radius:16px; overflow:hidden; }
