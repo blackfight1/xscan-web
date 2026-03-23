@@ -44,15 +44,17 @@ type Config struct {
 }
 
 type taskExecution struct {
-	cancel    context.CancelFunc
-	cmd       *exec.Cmd
-	recentLog []string
+	cancel       context.CancelFunc
+	cmd          *exec.Cmd
+	recentLog    []string
+	lastOutputAt *time.Time
+	logDirty     bool
 }
 
 const (
-	scanOutputQuietThreshold  = 10 * time.Minute
-	stageOutputQuietThreshold = 5 * time.Minute
-	maxRecentLogLines         = 120
+	maxRecentLogLines        = 120
+	outputFlushInterval      = 2 * time.Second
+	scanOutputQuietThreshold = 10 * time.Minute
 )
 
 func New(cfg Config) *Scanner {
@@ -441,28 +443,30 @@ func (s *Scanner) executeTask(ctx context.Context, taskID string) {
 		var xssCount int
 		var err error
 
+		s.resetTaskOutputState(taskID)
+
 		if len(urlList) == 1 {
-			// Single URL: use xscan spider -u
-			s.updateTaskStatus(taskID, models.StatusScanning, fmt.Sprintf("running xscan spider -u (%s)", urlList[0]))
+			// Single URL: use xscan spider -url
+			s.updateTaskStatus(taskID, models.StatusScanning, fmt.Sprintf("running xscan spider -url (%s)", urlList[0]))
 			xssCount, err = s.runXscanSingleURL(ctx, taskID, urlList[0], taskDir)
 			if err != nil {
 				if errors.Is(err, context.Canceled) {
 					s.cancelTask(taskID, "task cancelled")
 					return
 				}
-				s.failTask(taskID, fmt.Sprintf("xscan spider -u failed: %v", err))
+				s.failTask(taskID, fmt.Sprintf("xscan spider -url failed: %v", err))
 				return
 			}
 		} else {
-			// Multiple URLs: use xscan spider -f
-			s.updateTaskStatus(taskID, models.StatusScanning, fmt.Sprintf("running xscan spider -f (%d URLs)", len(urlList)))
+			// Multiple URLs: use xscan spider -file
+			s.updateTaskStatus(taskID, models.StatusScanning, fmt.Sprintf("running xscan spider -file (%d URLs)", len(urlList)))
 			xssCount, err = s.runXscan(ctx, taskID, urlList, taskDir)
 			if err != nil {
 				if errors.Is(err, context.Canceled) {
 					s.cancelTask(taskID, "task cancelled")
 					return
 				}
-				s.failTask(taskID, fmt.Sprintf("xscan spider -f failed: %v", err))
+				s.failTask(taskID, fmt.Sprintf("xscan spider -file failed: %v", err))
 				return
 			}
 		}
@@ -531,14 +535,15 @@ func (s *Scanner) executeTask(ctx context.Context, taskID string) {
 		return
 	}
 
-	s.updateTaskStatus(taskID, models.StatusScanning, "running xscan spider -f")
+	s.resetTaskOutputState(taskID)
+	s.updateTaskStatus(taskID, models.StatusScanning, "running xscan spider -file")
 	xssCount, err := s.runXscan(ctx, taskID, aliveURLs, taskDir)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			s.cancelTask(taskID, "task cancelled")
 			return
 		}
-		s.failTask(taskID, fmt.Sprintf("xscan spider -f failed: %v", err))
+		s.failTask(taskID, fmt.Sprintf("xscan spider -file failed: %v", err))
 		return
 	}
 
@@ -654,7 +659,7 @@ func (s *Scanner) probeAlive(ctx context.Context, taskID string, subdomains []st
 	return readLines(outputFile)
 }
 
-// runXscan runs xscan spider using -f and splits large URL lists into batches.
+// runXscan runs xscan spider using -file and splits large URL lists into batches.
 func (s *Scanner) runXscan(ctx context.Context, taskID string, urls []string, taskDir string) (int, error) {
 	taskDirAbs, err := filepath.Abs(taskDir)
 	if err != nil {
@@ -715,16 +720,16 @@ func (s *Scanner) runXscanBatch(ctx context.Context, taskID string, urls []strin
 	}
 
 	log.Printf("[Task %s] Scanning batch %d/%d (%d URLs) by file: %s", taskID, batchIndex+1, totalBatches, len(urls), targetsFile)
-	cmd := exec.CommandContext(ctx, xscanPathAbs, "--output-dir", batchOutputDir, "spider", "-f", targetsFile)
+	cmd := exec.CommandContext(ctx, xscanPathAbs, "--output-dir", batchOutputDir, "spider", "-file", targetsFile)
 	cmd.Dir = xscanDir
 	output, err := s.runCommand(taskID, cmd)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			return 0, context.Canceled
 		}
-		if strings.Contains(string(output), "flag provided but not defined: -f") {
-			log.Printf("[Task %s] batch %d/%d: -f not supported, fallback to -file", taskID, batchIndex+1, totalBatches)
-			cmd = exec.CommandContext(ctx, xscanPathAbs, "--output-dir", batchOutputDir, "spider", "-file", targetsFile)
+		if strings.Contains(string(output), "flag provided but not defined: -file") {
+			log.Printf("[Task %s] batch %d/%d: -file not supported, fallback to -f", taskID, batchIndex+1, totalBatches)
+			cmd = exec.CommandContext(ctx, xscanPathAbs, "--output-dir", batchOutputDir, "spider", "-f", targetsFile)
 			cmd.Dir = xscanDir
 			output, err = s.runCommand(taskID, cmd)
 		}
@@ -743,7 +748,7 @@ func (s *Scanner) runXscanBatch(ctx context.Context, taskID string, urls []strin
 	return s.parseAndStoreXSSReports(ctx, taskID, batchOutputDir, taskDirAbs)
 }
 
-// runXscanSingleURL runs xscan spider directly on one URL using -u.
+// runXscanSingleURL runs xscan spider directly on one URL using -url.
 func (s *Scanner) runXscanSingleURL(ctx context.Context, taskID, targetURL, taskDir string) (int, error) {
 	taskDirAbs, err := filepath.Abs(taskDir)
 	if err != nil {
@@ -758,18 +763,27 @@ func (s *Scanner) runXscanSingleURL(ctx context.Context, taskID, targetURL, task
 		return 0, err
 	}
 
-	s.setBatchProgress(taskID, 1, 1, fmt.Sprintf("running xscan spider -u (%s)", targetURL))
-	log.Printf("[Task %s] Scanning single URL by -u: %s", taskID, targetURL)
-	cmd := exec.CommandContext(ctx, xscanPathAbs, "--output-dir", xssOutputDir, "spider", "-u", targetURL)
+	s.setBatchProgress(taskID, 1, 1, fmt.Sprintf("running xscan spider -url (%s)", targetURL))
+	log.Printf("[Task %s] Scanning single URL by -url: %s", taskID, targetURL)
+	cmd := exec.CommandContext(ctx, xscanPathAbs, "--output-dir", xssOutputDir, "spider", "-url", targetURL)
 	cmd.Dir = xscanDir
 	output, err := s.runCommand(taskID, cmd)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			return 0, context.Canceled
 		}
-		if strings.Contains(string(output), "flag provided but not defined: -u") {
+		if strings.Contains(string(output), "flag provided but not defined: -url") {
+			log.Printf("[Task %s] -url not supported, fallback to -u", taskID)
+			cmd = exec.CommandContext(ctx, xscanPathAbs, "--output-dir", xssOutputDir, "spider", "-u", targetURL)
+			cmd.Dir = xscanDir
+			output, err = s.runCommand(taskID, cmd)
+		}
+		if err != nil && strings.Contains(string(output), "flag provided but not defined: -u") {
 			log.Printf("[Task %s] -u not supported, fallback to file mode", taskID)
 			return s.runXscan(ctx, taskID, []string{targetURL}, taskDirAbs)
+		}
+		if err == nil {
+			return s.parseAndStoreXSSReports(ctx, taskID, xssOutputDir, taskDirAbs)
 		}
 		return 0, fmt.Errorf("xscan spider url scan failed: %w, output: %s", err, string(output))
 	}
@@ -901,17 +915,31 @@ func (s *Scanner) cancelTask(taskID, reason string) {
 
 func (s *Scanner) markTaskStarted(taskID string) {
 	now := time.Now()
-	s.mu.Lock()
-	if state, ok := s.executions[taskID]; ok && state != nil {
-		state.recentLog = nil
-	}
-	s.mu.Unlock()
+	s.clearTaskOutputState(taskID)
 	database.DB.Exec(
 		`UPDATE tasks
 		 SET updated_at = ?, worker_started_at = ?, last_output_at = NULL, recent_log = '', current_batch = 0, total_batches = 0
 		 WHERE id = ?`,
 		now, now, taskID,
 	)
+}
+
+func (s *Scanner) resetTaskOutputState(taskID string) {
+	s.clearTaskOutputState(taskID)
+	database.DB.Exec(
+		`UPDATE tasks SET last_output_at = NULL, recent_log = '' WHERE id = ?`,
+		taskID,
+	)
+}
+
+func (s *Scanner) clearTaskOutputState(taskID string) {
+	s.mu.Lock()
+	if state, ok := s.executions[taskID]; ok && state != nil {
+		state.recentLog = nil
+		state.lastOutputAt = nil
+		state.logDirty = false
+	}
+	s.mu.Unlock()
 }
 
 func (s *Scanner) setBatchProgress(taskID string, currentBatch, totalBatches int, step string) {
@@ -955,6 +983,8 @@ func (s *Scanner) runCommand(taskID string, cmd *exec.Cmd) ([]byte, error) {
 
 	var output strings.Builder
 	done := make(chan struct{})
+	stopFlush := s.startOutputFlusher(taskID)
+	defer stopFlush()
 	go s.captureCommandOutput(taskID, reader, &output, done)
 
 	if err := cmd.Start(); err != nil {
@@ -971,6 +1001,29 @@ func (s *Scanner) runCommand(taskID string, cmd *exec.Cmd) ([]byte, error) {
 	_ = reader.Close()
 
 	return []byte(output.String()), waitErr
+}
+
+func (s *Scanner) startOutputFlusher(taskID string) func() {
+	stop := make(chan struct{})
+
+	go func() {
+		ticker := time.NewTicker(outputFlushInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				s.flushTaskOutput(taskID)
+			case <-stop:
+				return
+			}
+		}
+	}()
+
+	return func() {
+		close(stop)
+		s.flushTaskOutput(taskID)
+	}
 }
 
 func (s *Scanner) captureCommandOutput(taskID string, reader *io.PipeReader, output *strings.Builder, done chan<- struct{}) {
@@ -1000,7 +1053,6 @@ func (s *Scanner) recordTaskOutput(taskID, line string) {
 	}
 
 	now := time.Now()
-	recentLog := cleaned
 
 	s.mu.Lock()
 	if state, ok := s.executions[taskID]; ok && state != nil {
@@ -1008,15 +1060,46 @@ func (s *Scanner) recordTaskOutput(taskID, line string) {
 		if len(state.recentLog) > maxRecentLogLines {
 			state.recentLog = append([]string(nil), state.recentLog[len(state.recentLog)-maxRecentLogLines:]...)
 		}
-		recentLog = strings.Join(state.recentLog, "\n")
+		state.lastOutputAt = &now
+		state.logDirty = true
 	}
 	s.mu.Unlock()
+}
+
+func (s *Scanner) flushTaskOutput(taskID string) {
+	var (
+		lastOutputAt *time.Time
+		recentLog    string
+	)
+
+	s.mu.Lock()
+	state, ok := s.executions[taskID]
+	if !ok || state == nil || !state.logDirty {
+		s.mu.Unlock()
+		return
+	}
+	if state.lastOutputAt != nil {
+		ts := *state.lastOutputAt
+		lastOutputAt = &ts
+	}
+	recentLog = strings.Join(state.recentLog, "\n")
+	state.logDirty = false
+	s.mu.Unlock()
+
+	if lastOutputAt == nil {
+		return
+	}
 
 	if _, err := database.DB.Exec(
 		`UPDATE tasks SET last_output_at = ?, recent_log = ? WHERE id = ?`,
-		now, recentLog, taskID,
+		*lastOutputAt, recentLog, taskID,
 	); err != nil {
 		log.Printf("[Task %s] Failed to persist command output: %v", taskID, err)
+		s.mu.Lock()
+		if state, ok := s.executions[taskID]; ok && state != nil {
+			state.logDirty = true
+		}
+		s.mu.Unlock()
 	}
 }
 
@@ -1062,19 +1145,11 @@ func applyDerivedTaskState(task *models.Task) {
 }
 
 func isOutputTrackedStatus(status string) bool {
-	switch status {
-	case models.StatusSubdomain, models.StatusHttpx, models.StatusScanning:
-		return true
-	default:
-		return false
-	}
+	return status == models.StatusScanning
 }
 
-func outputQuietThresholdFor(status string) time.Duration {
-	if status == models.StatusScanning {
-		return scanOutputQuietThreshold
-	}
-	return stageOutputQuietThreshold
+func outputQuietThresholdFor(_ string) time.Duration {
+	return scanOutputQuietThreshold
 }
 
 func isValidHTTPURL(raw string) bool {

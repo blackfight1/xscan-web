@@ -400,22 +400,28 @@ function formatElapsed(value) {
   return `${Math.floor(diffSec / 86400)}d`
 }
 
+function isXscanOutputContext(task) {
+  return ['xss_scanning', 'completed', 'failed', 'cancelled'].includes(task?.status)
+}
+
 function taskProgressText(task) {
   if (!task) return '-'
   const parts = []
+  const outputLabel = isXscanOutputContext(task) ? 'xscan output' : 'output'
+  const activityLabel = isXscanOutputContext(task) ? 'xscan activity' : 'activity'
   if (task.total_batches > 0) {
     parts.push(`Batch ${Math.max(0, task.current_batch)}/${task.total_batches}`)
   }
   if (task.last_output_at) {
     parts.push(
       task.is_suspected_abnormal
-        ? `No output for ${formatElapsed(task.last_output_at)}`
-        : `Last activity ${formatRelativeTime(task.last_output_at)}`
+        ? `No ${outputLabel} for ${formatElapsed(task.last_output_at)}`
+        : `Last ${activityLabel} ${formatRelativeTime(task.last_output_at)}`
     )
   } else if (task.worker_started_at) {
     parts.push(
       task.is_suspected_abnormal
-        ? `No output for ${formatElapsed(task.worker_started_at)}`
+        ? `No ${outputLabel} for ${formatElapsed(task.worker_started_at)}`
         : `Started ${formatRelativeTime(task.worker_started_at)}`
     )
   }

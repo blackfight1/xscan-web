@@ -311,7 +311,10 @@ const taskBatchText = computed(() => {
 
 const taskActivityText = computed(() => buildActivityText(task.value))
 
-const outputPanelTitle = computed(() => (isRunning.value ? 'Real-time Output' : 'Recent Output'))
+const outputPanelTitle = computed(() => {
+  const label = isXscanOutputContext(task.value) ? 'Xscan Output' : 'Output'
+  return isRunning.value ? `Real-time ${label}` : `Recent ${label}`
+})
 
 const outputPanelSubtitle = computed(() => {
   if (!task.value) return 'No task data'
@@ -603,16 +606,22 @@ function formatElapsed(value) {
   return formatRelativeTime(value)
 }
 
+function isXscanOutputContext(taskItem) {
+  return ['xss_scanning', 'completed', 'failed', 'cancelled'].includes(taskItem?.status)
+}
+
 function buildActivityText(taskItem) {
   if (!taskItem) return ''
+  const outputLabel = isXscanOutputContext(taskItem) ? 'xscan output' : 'output'
+  const activityLabel = isXscanOutputContext(taskItem) ? 'xscan activity' : 'activity'
   if (taskItem.last_output_at) {
     return taskItem.is_suspected_abnormal
-      ? `No output for ${formatElapsed(taskItem.last_output_at)}`
-      : `Last activity ${formatRelativeTime(taskItem.last_output_at)} ago`
+      ? `No ${outputLabel} for ${formatElapsed(taskItem.last_output_at)}`
+      : `Last ${activityLabel} ${formatRelativeTime(taskItem.last_output_at)} ago`
   }
   if (taskItem.worker_started_at) {
     return taskItem.is_suspected_abnormal
-      ? `No output for ${formatElapsed(taskItem.worker_started_at)}`
+      ? `No ${outputLabel} for ${formatElapsed(taskItem.worker_started_at)}`
       : `Started ${formatRelativeTime(taskItem.worker_started_at)} ago`
   }
   return ''
