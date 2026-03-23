@@ -56,14 +56,14 @@
             </div>
           </div>
 
-          <div class="cur-step" v-if="task.current_step && (isRunning || task.is_stalled)">
+          <div class="cur-step" v-if="task.current_step && isRunning">
             <div class="pulse-dot"></div>
             <span>{{ task.current_step }}</span>
           </div>
-          <div class="heartbeat-bar" v-if="taskBatchText || taskHeartbeatText">
+          <div class="heartbeat-bar" v-if="taskBatchText || taskProgressText">
             <span v-if="taskBatchText">{{ taskBatchText }}</span>
-            <span v-if="taskBatchText && taskHeartbeatText" class="sep">|</span>
-            <span v-if="taskHeartbeatText">{{ taskHeartbeatText }}</span>
+            <span v-if="taskBatchText && taskProgressText" class="sep">|</span>
+            <span v-if="taskProgressText">{{ taskProgressText }}</span>
           </div>
           <div class="err-bar" v-if="task.error_message">
             <el-icon color="#f87171"><WarningFilled /></el-icon>
@@ -261,7 +261,6 @@ const openedFindingId = ref('')
 let timer = null
 
 const isRunning = computed(() => task.value && ['pending', 'subdomain_collecting', 'httpx_probing', 'xss_scanning'].includes(task.value.status))
-const isStalled = computed(() => Boolean(task.value?.is_stalled))
 
 const filteredSubs = computed(() => {
   const list = detail.value?.subdomains || []
@@ -300,12 +299,7 @@ const taskBatchText = computed(() => {
   return `Batch ${Math.max(0, task.value.current_batch || 0)}/${task.value.total_batches}`
 })
 
-const taskHeartbeatText = computed(() => {
-  if (task.value?.last_heartbeat_at) {
-    return isStalled.value
-      ? `No heartbeat for ${formatRelativeTime(task.value.last_heartbeat_at)}`
-      : `Last heartbeat ${formatRelativeTime(task.value.last_heartbeat_at)}`
-  }
+const taskProgressText = computed(() => {
   if (task.value?.worker_started_at) {
     return `Started ${formatRelativeTime(task.value.worker_started_at)}`
   }
@@ -666,12 +660,10 @@ function statusText(status) {
 }
 
 function taskStatusClass(taskItem) {
-  if (taskItem?.is_stalled) return 'stalled'
   return statusClass(taskItem?.status)
 }
 
 function taskStatusText(taskItem) {
-  if (taskItem?.is_stalled) return 'Stalled'
   return statusText(taskItem?.status)
 }
 
@@ -725,8 +717,6 @@ onUnmounted(() => {
 .status-failed .status-dot { background:#f87171; }
 .status-cancelled { background:rgba(100,116,139,.15); color:#64748b; }
 .status-cancelled .status-dot { background:#64748b; }
-.status-stalled { background:rgba(249,115,22,.16); color:#fb923c; }
-.status-stalled .status-dot { background:#fb923c; }
 @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
 
 .header-meta { font-size:13px; color:var(--text-muted); }

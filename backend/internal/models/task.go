@@ -34,9 +34,7 @@ type Task struct {
 	CreatedAt       time.Time  `json:"created_at"`
 	UpdatedAt       time.Time  `json:"updated_at"`
 	WorkerStartedAt *time.Time `json:"worker_started_at"`
-	LastHeartbeatAt *time.Time `json:"last_heartbeat_at"`
 	FinishedAt      *time.Time `json:"finished_at"`
-	IsStalled       bool       `json:"is_stalled"`
 }
 
 type Subdomain struct {
