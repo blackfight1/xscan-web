@@ -899,13 +899,21 @@ func (s *Scanner) markTaskStarted(taskID string) {
 	)
 }
 
-func (s *Scanner) setBatchProgress(taskID, currentBatch, totalBatches int, step string) {
+func (s *Scanner) setBatchProgress(taskID string, currentBatch, totalBatches int, step string) {
 	now := time.Now()
 	database.DB.Exec(
 		`UPDATE tasks
 		 SET status = ?, current_step = ?, current_batch = ?, total_batches = ?, updated_at = ?, last_heartbeat_at = ?
 		 WHERE id = ?`,
 		models.StatusScanning, step, currentBatch, totalBatches, now, now, taskID,
+	)
+}
+
+func (s *Scanner) touchHeartbeat(taskID string) {
+	now := time.Now()
+	database.DB.Exec(
+		`UPDATE tasks SET last_heartbeat_at = ?, updated_at = ? WHERE id = ?`,
+		now, now, taskID,
 	)
 }
 
@@ -926,7 +934,9 @@ func (s *Scanner) runCommand(taskID string, cmd *exec.Cmd) ([]byte, error) {
 	}
 	s.mu.Unlock()
 
+	stopHeartbeat := s.startCommandHeartbeat(taskID)
 	defer func() {
+		stopHeartbeat()
 		s.mu.Lock()
 		if state, ok := s.executions[taskID]; ok && state.cmd == cmd {
 			state.cmd = nil
@@ -935,6 +945,29 @@ func (s *Scanner) runCommand(taskID string, cmd *exec.Cmd) ([]byte, error) {
 	}()
 
 	return cmd.CombinedOutput()
+}
+
+func (s *Scanner) startCommandHeartbeat(taskID string) func() {
+	stop := make(chan struct{})
+
+	go func() {
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				s.touchHeartbeat(taskID)
+			case <-stop:
+				return
+			}
+		}
+	}()
+
+	return func() {
+		close(stop)
+		s.touchHeartbeat(taskID)
+	}
 }
 
 func (s *Scanner) cancelExecution(taskID string) {
