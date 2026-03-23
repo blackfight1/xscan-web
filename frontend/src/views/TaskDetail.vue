@@ -14,9 +14,9 @@
             <span :class="['mode-badge', task.scan_mode === 'url' ? 'mode-url' : 'mode-domain']">
               {{ task.scan_mode === 'url' ? 'URL' : 'Domain' }}
             </span>
-            <span :class="['status-badge', `status-${statusClass(task.status)}`]">
+            <span :class="['status-badge', `status-${taskStatusClass(task)}`]">
               <span class="status-dot"></span>
-              {{ statusText(task.status) }}
+              {{ taskStatusText(task) }}
             </span>
           </div>
           <div class="header-meta">
@@ -56,9 +56,14 @@
             </div>
           </div>
 
-          <div class="cur-step" v-if="task.current_step && isRunning">
+          <div class="cur-step" v-if="task.current_step && (isRunning || task.is_stalled)">
             <div class="pulse-dot"></div>
             <span>{{ task.current_step }}</span>
+          </div>
+          <div class="heartbeat-bar" v-if="taskBatchText || taskHeartbeatText">
+            <span v-if="taskBatchText">{{ taskBatchText }}</span>
+            <span v-if="taskBatchText && taskHeartbeatText" class="sep">|</span>
+            <span v-if="taskHeartbeatText">{{ taskHeartbeatText }}</span>
           </div>
           <div class="err-bar" v-if="task.error_message">
             <el-icon color="#f87171"><WarningFilled /></el-icon>
@@ -256,6 +261,7 @@ const openedFindingId = ref('')
 let timer = null
 
 const isRunning = computed(() => task.value && ['pending', 'subdomain_collecting', 'httpx_probing', 'xss_scanning'].includes(task.value.status))
+const isStalled = computed(() => Boolean(task.value?.is_stalled))
 
 const filteredSubs = computed(() => {
   const list = detail.value?.subdomains || []
@@ -287,6 +293,23 @@ const duration = computed(() => {
   if (diff < 60) return `${diff}s`
   if (diff < 3600) return `${Math.floor(diff / 60)}m ${diff % 60}s`
   return `${Math.floor(diff / 3600)}h ${Math.floor((diff % 3600) / 60)}m`
+})
+
+const taskBatchText = computed(() => {
+  if (!task.value?.total_batches) return ''
+  return `Batch ${Math.max(0, task.value.current_batch || 0)}/${task.value.total_batches}`
+})
+
+const taskHeartbeatText = computed(() => {
+  if (task.value?.last_heartbeat_at) {
+    return isStalled.value
+      ? `No heartbeat for ${formatRelativeTime(task.value.last_heartbeat_at)}`
+      : `Last heartbeat ${formatRelativeTime(task.value.last_heartbeat_at)}`
+  }
+  if (task.value?.worker_started_at) {
+    return `Started ${formatRelativeTime(task.value.worker_started_at)}`
+  }
+  return ''
 })
 
 const xssFindings = computed(() => {
@@ -559,6 +582,15 @@ function renderMd(content) {
   }
 }
 
+function formatRelativeTime(value) {
+  if (!value) return '-'
+  const diffSec = Math.max(0, Math.floor((Date.now() - new Date(value).getTime()) / 1000))
+  if (diffSec < 60) return `${diffSec}s`
+  if (diffSec < 3600) return `${Math.floor(diffSec / 60)}m`
+  if (diffSec < 86400) return `${Math.floor(diffSec / 3600)}h`
+  return `${Math.floor(diffSec / 86400)}d`
+}
+
 function sanitizeRenderedHtml(html) {
   const template = document.createElement('template')
   template.innerHTML = String(html || '')
@@ -633,6 +665,16 @@ function statusText(status) {
   return { pending: 'Pending', subdomain_collecting: 'Collecting', httpx_probing: 'Probing', xss_scanning: 'Scanning', completed: 'Completed', failed: 'Failed', cancelled: 'Cancelled' }[status] || status
 }
 
+function taskStatusClass(taskItem) {
+  if (taskItem?.is_stalled) return 'stalled'
+  return statusClass(taskItem?.status)
+}
+
+function taskStatusText(taskItem) {
+  if (taskItem?.is_stalled) return 'Stalled'
+  return statusText(taskItem?.status)
+}
+
 function formatTime(value) {
   return value
     ? new Date(value).toLocaleString('en-US', { hour12: false, month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
@@ -683,6 +725,8 @@ onUnmounted(() => {
 .status-failed .status-dot { background:#f87171; }
 .status-cancelled { background:rgba(100,116,139,.15); color:#64748b; }
 .status-cancelled .status-dot { background:#64748b; }
+.status-stalled { background:rgba(249,115,22,.16); color:#fb923c; }
+.status-stalled .status-dot { background:#fb923c; }
 @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
 
 .header-meta { font-size:13px; color:var(--text-muted); }
@@ -701,6 +745,7 @@ onUnmounted(() => {
 
 .cur-step { display:flex; align-items:center; gap:10px; padding:12px 16px; background:rgba(245,158,11,.08); border:1px solid rgba(245,158,11,.2); border-radius:10px; font-size:13px; color:#fbbf24; margin-top:16px; }
 .pulse-dot { width:8px; height:8px; border-radius:50%; background:#fbbf24; animation:pulse 1.5s infinite; flex-shrink:0; }
+.heartbeat-bar { display:flex; align-items:center; gap:8px; padding:10px 16px; background:rgba(14,165,233,.08); border:1px solid rgba(14,165,233,.18); border-radius:10px; font-size:12px; color:#7dd3fc; margin-top:12px; flex-wrap:wrap; }
 .err-bar { display:flex; align-items:center; gap:10px; padding:12px 16px; background:rgba(239,68,68,.08); border:1px solid rgba(239,68,68,.2); border-radius:10px; font-size:13px; color:#fca5a5; margin-top:16px; }
 
 /* Stats */

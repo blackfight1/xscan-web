@@ -47,6 +47,11 @@ type taskExecution struct {
 	cmd    *exec.Cmd
 }
 
+const (
+	scanStalledThreshold  = 20 * time.Minute
+	stageStalledThreshold = 10 * time.Minute
+)
+
 func New(cfg Config) *Scanner {
 	if cfg.MaxConcurrent <= 0 {
 		cfg.MaxConcurrent = 2
@@ -125,7 +130,6 @@ func (s *Scanner) recoverTasks() {
 		log.Printf("Failed to recover tasks: %v", err)
 		return
 	}
-	defer rows.Close()
 
 	var pendingIDs []string
 	var interruptedIDs []string
@@ -141,21 +145,26 @@ func (s *Scanner) recoverTasks() {
 			pendingIDs = append(pendingIDs, taskID)
 			continue
 		}
+		interruptedIDs = append(interruptedIDs, taskID)
+	}
+	rows.Close()
 
+	for _, taskID := range interruptedIDs {
 		now := time.Now()
 		_, err := database.DB.Exec(
 			`UPDATE tasks
-			 SET status = ?, current_step = ?, error_message = ?, updated_at = ?, finished_at = ?
+			 SET status = ?, current_step = ?, error_message = ?, updated_at = ?, last_heartbeat_at = ?, finished_at = ?
 			 WHERE id = ?`,
 			models.StatusFailed,
 			"failed",
 			"task interrupted by service restart or process termination",
 			now,
 			now,
+			now,
 			taskID,
 		)
-		if err == nil {
-			interruptedIDs = append(interruptedIDs, taskID)
+		if err != nil {
+			log.Printf("Failed to mark interrupted task %s as failed: %v", taskID, err)
 		}
 	}
 
@@ -215,25 +224,34 @@ func (s *Scanner) CreateTask(scanMode, rootDomain, targetURL string) (*models.Ta
 func (s *Scanner) GetTask(id string) (*models.Task, error) {
 	task := &models.Task{}
 	var finishedAt sql.NullTime
+	var workerStartedAt sql.NullTime
+	var lastHeartbeatAt sql.NullTime
 
 	err := database.DB.QueryRow(
 		`SELECT id, scan_mode, root_domain, target_url, status, subdomain_count, alive_count, xss_count,
-		        current_step, error_message, created_at, updated_at, finished_at
+		        current_step, error_message, current_batch, total_batches, created_at, updated_at, worker_started_at, last_heartbeat_at, finished_at
 		 FROM tasks WHERE id = ?`,
 		id,
 	).Scan(
 		&task.ID, &task.ScanMode, &task.RootDomain, &task.TargetURL, &task.Status,
 		&task.SubdomainCount, &task.AliveCount, &task.XssCount,
-		&task.CurrentStep, &task.ErrorMessage,
-		&task.CreatedAt, &task.UpdatedAt, &finishedAt,
+		&task.CurrentStep, &task.ErrorMessage, &task.CurrentBatch, &task.TotalBatches,
+		&task.CreatedAt, &task.UpdatedAt, &workerStartedAt, &lastHeartbeatAt, &finishedAt,
 	)
 	if err != nil {
 		return nil, err
 	}
 
+	if workerStartedAt.Valid {
+		task.WorkerStartedAt = &workerStartedAt.Time
+	}
+	if lastHeartbeatAt.Valid {
+		task.LastHeartbeatAt = &lastHeartbeatAt.Time
+	}
 	if finishedAt.Valid {
 		task.FinishedAt = &finishedAt.Time
 	}
+	applyDerivedTaskState(task)
 	return task, nil
 }
 
@@ -241,7 +259,7 @@ func (s *Scanner) GetTask(id string) (*models.Task, error) {
 func (s *Scanner) GetTasks() ([]models.Task, error) {
 	rows, err := database.DB.Query(
 		`SELECT id, scan_mode, root_domain, target_url, status, subdomain_count, alive_count, xss_count,
-		        current_step, error_message, created_at, updated_at, finished_at
+		        current_step, error_message, current_batch, total_batches, created_at, updated_at, worker_started_at, last_heartbeat_at, finished_at
 		 FROM tasks ORDER BY created_at DESC`,
 	)
 	if err != nil {
@@ -253,18 +271,27 @@ func (s *Scanner) GetTasks() ([]models.Task, error) {
 	for rows.Next() {
 		var task models.Task
 		var finishedAt sql.NullTime
+		var workerStartedAt sql.NullTime
+		var lastHeartbeatAt sql.NullTime
 		err := rows.Scan(
 			&task.ID, &task.ScanMode, &task.RootDomain, &task.TargetURL, &task.Status,
 			&task.SubdomainCount, &task.AliveCount, &task.XssCount,
-			&task.CurrentStep, &task.ErrorMessage,
-			&task.CreatedAt, &task.UpdatedAt, &finishedAt,
+			&task.CurrentStep, &task.ErrorMessage, &task.CurrentBatch, &task.TotalBatches,
+			&task.CreatedAt, &task.UpdatedAt, &workerStartedAt, &lastHeartbeatAt, &finishedAt,
 		)
 		if err != nil {
 			continue
 		}
+		if workerStartedAt.Valid {
+			task.WorkerStartedAt = &workerStartedAt.Time
+		}
+		if lastHeartbeatAt.Valid {
+			task.LastHeartbeatAt = &lastHeartbeatAt.Time
+		}
 		if finishedAt.Valid {
 			task.FinishedAt = &finishedAt.Time
 		}
+		applyDerivedTaskState(&task)
 		tasks = append(tasks, task)
 	}
 	return tasks, nil
@@ -365,6 +392,8 @@ func (s *Scanner) executeTask(ctx context.Context, taskID string) {
 		s.cancelTask(taskID, "task cancelled")
 		return
 	}
+
+	s.markTaskStarted(taskID)
 
 	taskDir := filepath.Join(s.resultsDir, taskID)
 	os.MkdirAll(taskDir, 0755)
@@ -644,9 +673,7 @@ func (s *Scanner) runXscan(ctx context.Context, taskID string, urls []string, ta
 			return 0, context.Canceled
 		}
 
-		if len(batches) > 1 {
-			s.updateTaskStatus(taskID, models.StatusScanning, fmt.Sprintf("running xscan batch %d/%d (%d URLs)", batchIndex+1, len(batches), len(batchURLs)))
-		}
+		s.setBatchProgress(taskID, batchIndex+1, len(batches), fmt.Sprintf("running xscan batch %d/%d (%d URLs)", batchIndex+1, len(batches), len(batchURLs)))
 
 		batchXSS, err := s.runXscanBatch(ctx, taskID, batchURLs, taskDirAbs, xssOutputDir, batchIndex, len(batches))
 		if err != nil {
@@ -721,6 +748,7 @@ func (s *Scanner) runXscanSingleURL(ctx context.Context, taskID, targetURL, task
 		return 0, err
 	}
 
+	s.setBatchProgress(taskID, 1, 1, fmt.Sprintf("running xscan spider -u (%s)", targetURL))
 	log.Printf("[Task %s] Scanning single URL by -u: %s", taskID, targetURL)
 	cmd := exec.CommandContext(ctx, xscanPathAbs, "--output-dir", xssOutputDir, "spider", "-u", targetURL)
 	cmd.Dir = xscanDir
@@ -820,24 +848,26 @@ func (s *Scanner) parseAndStoreXSSReports(ctx context.Context, taskID, xssOutput
 }
 
 func (s *Scanner) updateTaskStatus(taskID, status, step string) {
+	now := time.Now()
 	database.DB.Exec(
-		`UPDATE tasks SET status = ?, current_step = ?, updated_at = ? WHERE id = ?`,
-		status, step, time.Now(), taskID,
+		`UPDATE tasks SET status = ?, current_step = ?, updated_at = ?, last_heartbeat_at = ? WHERE id = ?`,
+		status, step, now, now, taskID,
 	)
 }
 
 func (s *Scanner) updateTaskCount(taskID, field string, count int) {
+	now := time.Now()
 	database.DB.Exec(
-		fmt.Sprintf(`UPDATE tasks SET %s = ?, updated_at = ? WHERE id = ?`, field),
-		count, time.Now(), taskID,
+		fmt.Sprintf(`UPDATE tasks SET %s = ?, updated_at = ?, last_heartbeat_at = ? WHERE id = ?`, field),
+		count, now, now, taskID,
 	)
 }
 
 func (s *Scanner) completeTask(taskID string) {
 	now := time.Now()
 	database.DB.Exec(
-		`UPDATE tasks SET status = ?, current_step = ?, updated_at = ?, finished_at = ? WHERE id = ?`,
-		models.StatusCompleted, "completed", now, now, taskID,
+		`UPDATE tasks SET status = ?, current_step = ?, updated_at = ?, last_heartbeat_at = ?, finished_at = ? WHERE id = ?`,
+		models.StatusCompleted, "completed", now, now, now, taskID,
 	)
 }
 
@@ -845,8 +875,8 @@ func (s *Scanner) failTask(taskID, errMsg string) {
 	log.Printf("[Task %s] Failed: %s", taskID, errMsg)
 	now := time.Now()
 	database.DB.Exec(
-		`UPDATE tasks SET status = ?, current_step = ?, error_message = ?, updated_at = ?, finished_at = ? WHERE id = ?`,
-		models.StatusFailed, "failed", errMsg, now, now, taskID,
+		`UPDATE tasks SET status = ?, current_step = ?, error_message = ?, updated_at = ?, last_heartbeat_at = ?, finished_at = ? WHERE id = ?`,
+		models.StatusFailed, "failed", errMsg, now, now, now, taskID,
 	)
 }
 
@@ -854,8 +884,28 @@ func (s *Scanner) cancelTask(taskID, reason string) {
 	log.Printf("[Task %s] Cancelled: %s", taskID, reason)
 	now := time.Now()
 	database.DB.Exec(
-		`UPDATE tasks SET status = ?, current_step = ?, error_message = ?, updated_at = ?, finished_at = ? WHERE id = ?`,
-		models.StatusCancelled, "cancelled", reason, now, now, taskID,
+		`UPDATE tasks SET status = ?, current_step = ?, error_message = ?, updated_at = ?, last_heartbeat_at = ?, finished_at = ? WHERE id = ?`,
+		models.StatusCancelled, "cancelled", reason, now, now, now, taskID,
+	)
+}
+
+func (s *Scanner) markTaskStarted(taskID string) {
+	now := time.Now()
+	database.DB.Exec(
+		`UPDATE tasks
+		 SET updated_at = ?, worker_started_at = ?, last_heartbeat_at = ?, current_batch = 0, total_batches = 0
+		 WHERE id = ?`,
+		now, now, now, taskID,
+	)
+}
+
+func (s *Scanner) setBatchProgress(taskID, currentBatch, totalBatches int, step string) {
+	now := time.Now()
+	database.DB.Exec(
+		`UPDATE tasks
+		 SET status = ?, current_step = ?, current_batch = ?, total_batches = ?, updated_at = ?, last_heartbeat_at = ?
+		 WHERE id = ?`,
+		models.StatusScanning, step, currentBatch, totalBatches, now, now, taskID,
 	)
 }
 
@@ -904,6 +954,42 @@ func (s *Scanner) cancelExecution(taskID string) {
 	if cmd != nil && cmd.Process != nil {
 		_ = cmd.Process.Kill()
 	}
+}
+
+func applyDerivedTaskState(task *models.Task) {
+	if task == nil {
+		return
+	}
+
+	task.IsStalled = false
+	if !isHeartbeatTrackedStatus(task.Status) {
+		return
+	}
+
+	reference := task.UpdatedAt
+	if task.LastHeartbeatAt != nil {
+		reference = *task.LastHeartbeatAt
+	}
+
+	if time.Since(reference) > stalledThresholdFor(task.Status) {
+		task.IsStalled = true
+	}
+}
+
+func isHeartbeatTrackedStatus(status string) bool {
+	switch status {
+	case models.StatusSubdomain, models.StatusHttpx, models.StatusScanning:
+		return true
+	default:
+		return false
+	}
+}
+
+func stalledThresholdFor(status string) time.Duration {
+	if status == models.StatusScanning {
+		return scanStalledThreshold
+	}
+	return stageStalledThreshold
 }
 
 func isValidHTTPURL(raw string) bool {

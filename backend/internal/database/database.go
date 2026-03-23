@@ -45,8 +45,12 @@ func createTables() {
 		xss_count INTEGER DEFAULT 0,
 		current_step TEXT DEFAULT '',
 		error_message TEXT DEFAULT '',
+		current_batch INTEGER DEFAULT 0,
+		total_batches INTEGER DEFAULT 0,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		worker_started_at DATETIME,
+		last_heartbeat_at DATETIME,
 		finished_at DATETIME
 	);
 
@@ -98,6 +102,26 @@ func ensureTaskColumns() {
 	_, err = DB.Exec("ALTER TABLE tasks ADD COLUMN target_url TEXT DEFAULT ''")
 	if err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 		log.Fatalf("Failed to add tasks.target_url: %v", err)
+	}
+
+	_, err = DB.Exec("ALTER TABLE tasks ADD COLUMN current_batch INTEGER DEFAULT 0")
+	if err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		log.Fatalf("Failed to add tasks.current_batch: %v", err)
+	}
+
+	_, err = DB.Exec("ALTER TABLE tasks ADD COLUMN total_batches INTEGER DEFAULT 0")
+	if err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		log.Fatalf("Failed to add tasks.total_batches: %v", err)
+	}
+
+	_, err = DB.Exec("ALTER TABLE tasks ADD COLUMN worker_started_at DATETIME")
+	if err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		log.Fatalf("Failed to add tasks.worker_started_at: %v", err)
+	}
+
+	_, err = DB.Exec("ALTER TABLE tasks ADD COLUMN last_heartbeat_at DATETIME")
+	if err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		log.Fatalf("Failed to add tasks.last_heartbeat_at: %v", err)
 	}
 }
 

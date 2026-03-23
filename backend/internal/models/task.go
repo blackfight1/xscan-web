@@ -19,19 +19,24 @@ const (
 )
 
 type Task struct {
-	ID             string     `json:"id"`
-	ScanMode       string     `json:"scan_mode"`
-	RootDomain     string     `json:"root_domain"`
-	TargetURL      string     `json:"target_url"`
-	Status         string     `json:"status"`
-	SubdomainCount int        `json:"subdomain_count"`
-	AliveCount     int        `json:"alive_count"`
-	XssCount       int        `json:"xss_count"`
-	CurrentStep    string     `json:"current_step"`
-	ErrorMessage   string     `json:"error_message"`
-	CreatedAt      time.Time  `json:"created_at"`
-	UpdatedAt      time.Time  `json:"updated_at"`
-	FinishedAt     *time.Time `json:"finished_at"`
+	ID              string     `json:"id"`
+	ScanMode        string     `json:"scan_mode"`
+	RootDomain      string     `json:"root_domain"`
+	TargetURL       string     `json:"target_url"`
+	Status          string     `json:"status"`
+	SubdomainCount  int        `json:"subdomain_count"`
+	AliveCount      int        `json:"alive_count"`
+	XssCount        int        `json:"xss_count"`
+	CurrentStep     string     `json:"current_step"`
+	ErrorMessage    string     `json:"error_message"`
+	CurrentBatch    int        `json:"current_batch"`
+	TotalBatches    int        `json:"total_batches"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
+	WorkerStartedAt *time.Time `json:"worker_started_at"`
+	LastHeartbeatAt *time.Time `json:"last_heartbeat_at"`
+	FinishedAt      *time.Time `json:"finished_at"`
+	IsStalled       bool       `json:"is_stalled"`
 }
 
 type Subdomain struct {

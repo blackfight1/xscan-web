@@ -126,9 +126,9 @@
 
         <el-table-column label="Status" width="160">
           <template #default="{ row }">
-            <span :class="['status-badge', `status-${statusClass(row.status)}`]">
+            <span :class="['status-badge', `status-${taskStatusClass(row)}`]">
               <span class="status-dot"></span>
-              {{ statusText(row.status) }}
+              {{ taskStatusText(row) }}
             </span>
           </template>
         </el-table-column>
@@ -137,6 +137,7 @@
           <template #default="{ row }">
             <div class="progress-cell">
               <span class="step-text">{{ row.current_step || '-' }}</span>
+              <span class="step-meta">{{ taskHeartbeatText(row) }}</span>
               <div class="progress-track">
                 <div class="progress-fill" :style="{ width: `${progressPercent(row)}%` }"></div>
               </div>
@@ -369,6 +370,40 @@ function statusText(status) {
     cancelled: 'Cancelled',
   }
   return map[status] || status
+}
+
+function taskStatusClass(task) {
+  if (task?.is_stalled) return 'stalled'
+  return statusClass(task?.status)
+}
+
+function taskStatusText(task) {
+  if (task?.is_stalled) return 'Stalled'
+  return statusText(task?.status)
+}
+
+function formatRelativeTime(value) {
+  if (!value) return 'No heartbeat yet'
+  const diffSec = Math.max(0, Math.floor((Date.now() - new Date(value).getTime()) / 1000))
+  if (diffSec < 60) return `${diffSec}s ago`
+  if (diffSec < 3600) return `${Math.floor(diffSec / 60)}m ago`
+  if (diffSec < 86400) return `${Math.floor(diffSec / 3600)}h ago`
+  return `${Math.floor(diffSec / 86400)}d ago`
+}
+
+function taskHeartbeatText(task) {
+  if (!task) return '-'
+  const parts = []
+  if (task.total_batches > 0) {
+    parts.push(`Batch ${Math.max(0, task.current_batch)}/${task.total_batches}`)
+  }
+  if (task.last_heartbeat_at) {
+    parts.push(`Heartbeat ${formatRelativeTime(task.last_heartbeat_at)}`)
+  }
+  if (!parts.length && task.worker_started_at) {
+    parts.push(`Started ${formatRelativeTime(task.worker_started_at)}`)
+  }
+  return parts.join(' | ') || 'No heartbeat yet'
 }
 
 function formatTime(time) {
@@ -697,6 +732,8 @@ onUnmounted(() => {
 .status-failed .status-dot { background: #f87171; }
 .status-cancelled { background: rgba(100, 116, 139, 0.15); color: #64748b; }
 .status-cancelled .status-dot { background: #64748b; }
+.status-stalled { background: rgba(249, 115, 22, 0.16); color: #fb923c; }
+.status-stalled .status-dot { background: #fb923c; }
 
 @keyframes pulse {
   0%, 100% { opacity: 1; }
@@ -715,6 +752,11 @@ onUnmounted(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.step-meta {
+  font-size: 11px;
+  color: var(--text-muted);
 }
 
 .progress-track {
